@@ -69,14 +69,44 @@ src/components/settings/CodeIntelSettings.tsx   how a user configures a server
 | C, C++, Objective-C | clangd | PATH. **Already on every Mac** with the Command Line Tools; `apt install clangd` on Linux, where the binary is versioned (`clangd-18`) so resolution tries those too |
 | Swift | sourcekit-lsp | PATH. Ships with the Command Line Tools on macOS and the Swift toolchain on Linux |
 | Ruby | ruby-lsp | the project's `bin/ruby-lsp` binstub first, then PATH |
+| Terraform | terraform-ls | the project's `bin/terraform-ls`, PATH, then termic's pinned HashiCorp download |
 
-The last three cost nothing to install on macOS and are one package on Linux,
+The C, Swift and Ruby servers cost nothing to install on macOS and are one package on Linux,
 which is why they are PATH-only rather than downloads: an `LspInstall` entry
 that duplicates a binary the machine already has is a liability, not a feature.
 
 Each was proved end to end against the real server before shipping, on a
 fixture in `e2e/fixtures/lsp-projects/<language>`: see "Proving it against real
 servers" below. What that flushed out is rules 18 and 19.
+
+### Terraform
+
+`.tf` and `.tfvars` have separate syntax names in the editor and send
+`terraform` and `terraform-vars` respectively, sharing one `terraform` server
+per checkout. `codemirror-lang-hcl` supplies the grammar, loaded only when an
+editor needs it. Generic `.hcl` files get highlighting but no Terraform
+server: Packer and Terragrunt are not Terraform. `.tf.json` and `.tfvars.json`
+remain JSON because terraform-ls does not support them.
+
+terraform-ls starts with `serve`. Its raw settings belong in
+`initializationOptions`, including `terraform.path` when the Terraform CLI
+is not on PATH. The user runs `terraform init` for provider schemas and
+installed modules; Termic does not run it on their behalf.
+
+HashiCorp publishes ZIPs and SHA256SUMS on `releases.hashicorp.com`, not
+GitHub release assets. The four macOS/Linux pins use version 0.39.0 and those
+checksums. The existing release resolver falls back to the pin, so updating
+this download requires a new pin, not the GitHub update button. ZIP extraction
+reuses the existing `zip` and `flate2` dependencies and runs only after the
+digest check, in the same staging directory as the other archive formats.
+
+The fixture smoke run on Linux used about 25 MB RSS after navigation and
+completion, and created no files in the checkout. It checks hover, a
+definition across files, symbols and an undefined-variable diagnostic.
+An existing infrastructure project also answered hover, definition and
+completion, used about 40 MB RSS and created no files in the checkout.
+Workspace symbols use block names such as `variable "Store"`, not the
+expression traversal `var.Store`; the recorded fixture preserves that shape.
 
 ## The rules
 
@@ -414,7 +444,7 @@ group of every registered server.
 
 ### 18. A server that writes into the checkout has to say so before it starts
 
-Three of the seven do, and none of it is in the protocol:
+Several servers do, and none of it is in the protocol:
 
 - **clangd** writes its background index to `<checkout>/.cache/clangd`. Without
   `--background-index` it answers find-usages from the open translation unit
@@ -508,7 +538,7 @@ The plan this file replaced (`docs/plans/lsp.md`, deleted when the work
 shipped) listed four things that are still absent. Three are choices rather
 than gaps:
 
-- **A registry for a language termic does not serve.** Adding an eighth
+- **A registry for a language termic does not serve.** Adding another
   language (Elixir, PHP, Java, Zig) means a new slot: extensions, an LSP
   `languageId`, project-detection markers, a display name, a memory figure and
   a catalog row. Parked on purpose. Nobody has asked, detection is something we
@@ -524,7 +554,7 @@ than gaps:
   a problem the first one has not yet been observed to miss.
 
 What IS covered instead: a custom command per language (rule 16b), which runs
-any binary the reader names for one of the seven languages. That is the
+any binary the reader names for one of the supported languages. That is the
 difference between "I want pylsp" (supported) and "I write Elixir" (not).
 
 ## Proving it against real servers
@@ -560,7 +590,8 @@ Two things the harness has to do that a reader would not guess:
   is absolute (generated, never committed), and sourcekit-lsp needs the package
   built once. Both are the first-run cost a real user pays too.
 
-All seven languages pass here as of the run that added the last three.
+The original seven passed when C++, Swift and Ruby were added. Terraform's
+0.39.0 fixture also passes `make lsp-smoke LANG_ONLY=terraform`.
 
 `--record` writes the raw `workspace/symbol` answers into
 `src/lib/lsp/__fixtures__/`, which `symbolSearch.realservers.test.ts` ranks in

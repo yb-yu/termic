@@ -7,7 +7,7 @@ import {
 // The pinned-download path (GH #174), driven through the app's own commands
 // against the real internet.
 //
-// **Opt-in**: it fetches ~35 MB from GitHub, so it is skipped unless
+// **Opt-in**: it fetches servers from GitHub and HashiCorp, so it is skipped unless
 // `E2E_LSP_DOWNLOADS=1` is set. `make e2e` and CI do not run it; a maintainer
 // runs it after touching the manifest, or to check that upstream has not moved
 // out from under it.
@@ -123,7 +123,7 @@ describe("code intelligence: server downloads", function () {
     if (!root) return;
     // The fixture repo is shared with every other spec file, and a dirty tree
     // fails git.e2e's "clean working tree" plus two layout specs.
-    for (const rel of ["broken.ts"]) rmSync(path.join(root, rel), { force: true });
+    for (const rel of ["broken.ts", "broken.tf"]) rmSync(path.join(root, rel), { force: true });
     rmSync(path.join(root, "pysrc"), { recursive: true, force: true });
     await browser.execute(() => window.__termic!.useCodeIntel.setState({ grants: {} }));
     await browser.execute(async () => {
@@ -140,7 +140,7 @@ describe("code intelligence: server downloads", function () {
     if (taskId) await archiveTask(taskId);
   });
 
-  for (const language of ["typescript", "python", "rust"]) {
+  for (const language of ["typescript", "python", "rust", "terraform"]) {
     it(`downloads and verifies the ${language} server`, async () => {
       const res = await install(language);
       // The error carries the reason: a renamed asset, an unreachable API, or
@@ -157,6 +157,15 @@ describe("code intelligence: server downloads", function () {
       expect(again.value).toBe(res.value);
     });
   }
+
+  it("runs the downloaded Terraform server and displays its diagnostics", async () => {
+    const resolved = await offer(root, "terraform");
+    expect(resolved.exe).toContain("/servers/terraform/");
+    writeFileSync(path.join(root, "broken.tf"), 'output "broken" { value = var.missing }\n');
+    await armGrant(root, taskId, "terraform");
+    await openFile(taskId, "broken.tf");
+    await waitVisible(`[data-task-id="${taskId}"] .cm-lintRange`, 30_000);
+  });
 
   it("resolves the downloaded server for a checkout with no toolchain", async () => {
     const o = await offer(root, "typescript");

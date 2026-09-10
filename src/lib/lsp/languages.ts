@@ -27,6 +27,8 @@ const LSP_ID_BY_NAME: Record<string, string> = {
   "Objective-C++": "objective-cpp",
   "Swift": "swift",
   "Ruby": "ruby",
+  "Terraform": "terraform",
+  "Terraform Variables": "terraform-vars",
   "Shell": "shellscript",
   "Properties files": "ini",
   "Markdown": "markdown",
@@ -54,6 +56,8 @@ const SERVER_BY_LSP_ID: Record<string, string> = {
   "objective-cpp": "cpp",
   swift: "swift",
   ruby: "ruby",
+  terraform: "terraform",
+  "terraform-vars": "terraform",
 };
 
 /** Every server id, which is also every language code intelligence can serve.
@@ -91,6 +95,7 @@ const LANGUAGE_NAME: Record<string, string> = {
   cpp: "C and C++",
   swift: "Swift",
   ruby: "Ruby",
+  terraform: "Terraform",
 };
 
 export function languageName(server: string): string {

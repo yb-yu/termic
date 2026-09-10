@@ -131,6 +131,82 @@ async function openSettled(
   );
 }
 
+describe("Terraform code navigation", () => {
+  let taskId = "";
+  let root = "";
+
+  before(async () => {
+    await waitForAppShell();
+    await requireTermicApi();
+    taskId = await openTask("terraform-nav");
+    root = await taskPath(taskId);
+    mkdirSync(path.join(root, "bin"), { recursive: true });
+    copyFileSync(fakeServer, path.join(root, "bin/terraform-ls"));
+    chmodSync(path.join(root, "bin/terraform-ls"), 0o755);
+    writeFileSync(path.join(root, "main.tf"), 'variable "answer" { default = 42 }\n');
+    writeFileSync(path.join(root, "dev.tfvars"), "answer = 42\n");
+    writeFileSync(path.join(root, "terragrunt.hcl"), "inputs = {}\n");
+    writeFileSync(path.join(root, "main.tf.json"), "{}\n");
+    await setCodeNavPref(true);
+    await setTypeChecking(true);
+    await clearGrants();
+  });
+
+  after(async () => {
+    await browser.execute(() => window.__termic!.useUI.getState().resolveConfirm(false));
+    await clearGrants();
+    await setTypeChecking(false);
+    if (taskId) await archiveTask(taskId);
+    if (!root) return;
+    for (const file of ["bin/terraform-ls", "main.tf", "dev.tfvars", "terragrunt.hcl", "main.tf.json", ".fake-lsp.json"]) {
+      rmSync(path.join(root, file), { force: true });
+    }
+  });
+
+  it("recognizes .tf files and offers terraform-ls without starting it", async () => {
+    await openSettled(taskId, "main.tf", "Terraform");
+    await waitVisible('[data-testid="code-intel-chip"]');
+    await browser.execute(() => {
+      (document.querySelector('[data-testid="code-intel-chip"]') as HTMLElement).click();
+    });
+    await waitVisible('[data-testid="code-intel-turn-on-for-this-task"]');
+    expect(await browser.execute(() => document.body.innerText)).toContain("terraform-ls");
+    expect(await browser.execute(async () => window.__termic!.invoke("lsp_list"))).toEqual([]);
+    await snap("terraform-navigation-offer.png");
+    await browser.keys("Escape");
+  });
+
+  it("connects .tf and .tfvars with distinct language ids to one server", async () => {
+    await armGrant(root, taskId, "terraform");
+    for (const [file, syntax, languageId] of [
+      ["main.tf", "Terraform", "terraform"],
+      ["dev.tfvars", "Terraform Variables", "terraform-vars"],
+    ]) {
+      await openSettled(taskId, file, syntax);
+      await browser.waitUntil(() => browser.execute(id =>
+        [...document.querySelectorAll(`[data-task-id="${id}"] .cm-lintRange`)]
+          .some(el => el.getBoundingClientRect().width > 0), taskId),
+      { timeout: 30_000, timeoutMsg: `${file} has no visible diagnostic` });
+      await browser.waitUntil(() => {
+        if (!existsSync(path.join(root, ".fake-lsp.json"))) return false;
+        const seen = JSON.parse(readFileSync(path.join(root, ".fake-lsp.json"), "utf8"));
+        return seen.opened.some((doc: { uri: string; languageId: string }) =>
+          doc.uri.endsWith(`/${file}`) && doc.languageId === languageId);
+      }, { timeout: 10_000, timeoutMsg: `${file} did not reach the Terraform server` });
+    }
+    const servers = await browser.execute(async () => window.__termic!.invoke("lsp_list")) as any[];
+    expect(servers.filter(s => s.language === "terraform")).toHaveLength(1);
+    await snap("terraform-variables-connected.png");
+  });
+
+  it("keeps unrelated HCL and JSON files out of Terraform navigation", async () => {
+    await openSettled(taskId, "terragrunt.hcl", "HCL");
+    await waitGone('[data-testid="code-intel-chip"]');
+    await openSettled(taskId, "main.tf.json", "JSON");
+    await waitGone('[data-testid="code-intel-chip"]');
+  });
+});
+
 describe("code intelligence", () => {
   let taskId = "";
   let root = "";

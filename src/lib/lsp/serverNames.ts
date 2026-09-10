@@ -23,6 +23,7 @@ const WOULD_INSTALL: Record<string, string> = {
   cpp: "clangd",
   swift: "sourcekit-lsp",
   ruby: "ruby-lsp",
+  terraform: "terraform-ls",
 };
 
 /** Every language termic can serve, with the name a settings page shows.
@@ -40,6 +41,7 @@ export const SERVABLE_LANGUAGES: readonly { id: string; label: string }[] = [
   { id: "cpp",        label: "C / C++ / Objective-C" },
   { id: "swift",      label: "Swift" },
   { id: "ruby",       label: "Ruby" },
+  { id: "terraform",  label: "Terraform" },
 ];
 
 /** The ids alone, for callers that only need membership. */
@@ -96,6 +98,7 @@ export const MEMORY_NOTE: Record<string, string> = {
   clangd: "clangd holds a few hundred MB for a project this size, and writes its index to .cache/clangd inside the checkout (worth a line in .gitignore).",
   "sourcekit-lsp": "sourcekit-lsp holds a few hundred MB, and answers best about a package that has been built at least once.",
   "ruby-lsp": "ruby-lsp holds around 200 MB, and writes a .ruby-lsp directory inside the checkout for its own bundle.",
+  "terraform-ls": "terraform-ls used about 25 MB on a small Terraform project. Larger projects and provider schemas can use more memory.",
 };
 
 
@@ -116,4 +119,5 @@ export const MEMORY_SHORT: Record<string, string> = {
   clangd: "a few hundred MB, plus an index in .cache/clangd",
   "sourcekit-lsp": "a few hundred MB",
   "ruby-lsp": "about 200 MB",
+  "terraform-ls": "about 25 MB on a small Terraform project",
 };

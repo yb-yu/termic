@@ -29,6 +29,17 @@ describe("registry name → LSP languageId", () => {
 });
 
 describe("which server answers", () => {
+  it("routes Terraform and its variable files to one server with distinct ids", () => {
+    expect(lspLanguageId("Terraform")).toBe("terraform");
+    expect(lspLanguageId("Terraform Variables")).toBe("terraform-vars");
+    expect(lspServerFor("Terraform")).toBe("terraform");
+    expect(lspServerFor("Terraform Variables")).toBe("terraform");
+    expect(languageName("terraform")).toBe("Terraform");
+    expect(SERVERS.filter(s => s === "terraform")).toHaveLength(1);
+    expect(lspServerFor("HCL")).toBeNull();
+    expect(lspServerFor("JSON")).toBeNull();
+  });
+
   it("routes the whole TypeScript family to one server", () => {
     // One server, four languageIds: TSX and JS are not separate servers, and
     // treating them as such would spawn three indexes of the same project.

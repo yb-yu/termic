@@ -14038,7 +14038,7 @@ struct LspInstall {
     sha256: &'static str,
     /// Roughly what the user is about to download, for the same offer.
     bytes: u64,
-    /// `gz` = one gzipped binary; `tar.gz` = an archive to unpack.
+    /// `gz` = one gzipped binary; `tar.gz` or `zip` = an archive to unpack.
     archive: &'static str,
     /// Path of the executable inside the unpacked directory. Empty for `gz`,
     /// which lands as the binary itself.
@@ -14074,6 +14074,41 @@ fn lsp_install_spec(language: &str) -> Option<LspInstall> {
     let arch = std::env::consts::ARCH;
     let key = (language, os, arch);
     Some(match key {
+        // HashiCorp publishes ZIPs on releases.hashicorp.com, with a
+        // SHA256SUMS file. Its GitHub releases have no assets, so the existing
+        // resolver falls back to these verified pins rather than guessing.
+        ("terraform", "macos", "aarch64") => LspInstall {
+            label: "terraform-ls", version: "0.39.0",
+            repo: "hashicorp/terraform-ls", asset: "terraform-ls_0.39.0_darwin_arm64.zip",
+            url: "https://releases.hashicorp.com/terraform-ls/0.39.0/terraform-ls_0.39.0_darwin_arm64.zip",
+            sha256: "6f80fe0b34af184175508f3d9135d8159f5dce4000d9b39540553eb1c267c54b",
+            bytes: 30_705_654, archive: "zip", exe_in_archive: "terraform-ls",
+            args: &["serve"],
+        },
+        ("terraform", "macos", "x86_64") => LspInstall {
+            label: "terraform-ls", version: "0.39.0",
+            repo: "hashicorp/terraform-ls", asset: "terraform-ls_0.39.0_darwin_amd64.zip",
+            url: "https://releases.hashicorp.com/terraform-ls/0.39.0/terraform-ls_0.39.0_darwin_amd64.zip",
+            sha256: "cc5bbc5b5a39d12d455c0d2b1e4b3a2c1f237d02d2cf819cf5252358f2d674de",
+            bytes: 31_418_012, archive: "zip", exe_in_archive: "terraform-ls",
+            args: &["serve"],
+        },
+        ("terraform", "linux", "aarch64") => LspInstall {
+            label: "terraform-ls", version: "0.39.0",
+            repo: "hashicorp/terraform-ls", asset: "terraform-ls_0.39.0_linux_arm64.zip",
+            url: "https://releases.hashicorp.com/terraform-ls/0.39.0/terraform-ls_0.39.0_linux_arm64.zip",
+            sha256: "62f32ea22cb78e5e5667ed638ad6e0fbde30ab59228d073c3c9bb249f89c7f5a",
+            bytes: 30_305_656, archive: "zip", exe_in_archive: "terraform-ls",
+            args: &["serve"],
+        },
+        ("terraform", "linux", "x86_64") => LspInstall {
+            label: "terraform-ls", version: "0.39.0",
+            repo: "hashicorp/terraform-ls", asset: "terraform-ls_0.39.0_linux_amd64.zip",
+            url: "https://releases.hashicorp.com/terraform-ls/0.39.0/terraform-ls_0.39.0_linux_amd64.zip",
+            sha256: "7750edc736845fd8c04ff0fc6332423c12d8275b358668c8c17e8aedc43ef971",
+            bytes: 31_026_533, archive: "zip", exe_in_archive: "terraform-ls",
+            args: &["serve"],
+        },
         // TypeScript 7 is a native Go binary: full TS/TSX navigation with no
         // Node runtime. NOT one file — the executable needs its ~26 MB of
         // sibling `lib.*.d.ts`, and shipping only the binary makes LSP mode
@@ -14596,6 +14631,9 @@ fn lsp_resolve_server(root: &Path, language: &str) -> Option<(String, Vec<String
             .or_else(|| local(".bundle/bin/ruby-lsp"))
             .or_else(|| on_path("ruby-lsp"))
             .map(|exe| (exe, vec![])),
+        "terraform" => local("bin/terraform-ls")
+            .or_else(|| on_path("terraform-ls"))
+            .map(|exe| (exe, vec!["serve".to_string()])),
         _ => None,
     };
     // The user's own toolchain wins; termic's download is the fallback, not
@@ -14637,6 +14675,13 @@ async fn lsp_install(language: String) -> Result<String, String> {
     }
     let asset = lsp_resolve_asset(&spec).await;
     lsp_install_version(&language, &spec, &asset).await
+}
+
+fn lsp_unpack_zip(bytes: &[u8], destination: &Path) -> Result<(), String> {
+    zip::ZipArchive::new(std::io::Cursor::new(bytes))
+        .map_err(|e| e.to_string())?
+        .extract(destination)
+        .map_err(|e| e.to_string())
 }
 
 /// Download one resolved asset, verify it, unpack it, and return its
@@ -14725,6 +14770,7 @@ async fn lsp_install_version(
                     let dec = GzDecoder::new(std::io::Cursor::new(&bytes[..]));
                     tar::Archive::new(dec).unpack(&staging).map_err(|e| e.to_string())?;
                 }
+                "zip" => lsp_unpack_zip(&bytes, &staging)?,
                 other => return Err(format!("unknown archive kind: {other}")),
             }
             Ok(())
@@ -15098,6 +15144,19 @@ async fn lsp_catalog() -> Vec<LspCatalogEntry> {
             exe: seek("ruby-lsp"),
             version: None,
             note: "The project's own binstub (`bundle binstubs ruby-lsp`) is used before any copy on your PATH, because a Rails app's gems are the point. Otherwise `gem install ruby-lsp`.",
+        }],
+    });
+
+    let (tf_installed, tf_version) = downloadable("terraform");
+    out.push(LspCatalogEntry {
+        language: "terraform".into(),
+        label: "Terraform",
+        servers: vec![LspCatalogServer {
+            name: "terraform-ls".into(),
+            source: "downloaded",
+            exe: seek("terraform-ls").or(tf_installed),
+            version: tf_version,
+            note: "The project's bin/terraform-ls first, then PATH, then termic's pinned download from HashiCorp. Run terraform init yourself for provider and module information.",
         }],
     });
 
@@ -24215,6 +24274,44 @@ mod tests {
     }
 
     #[test]
+    fn a_terraform_checkouts_binary_wins_and_starts_in_serve_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("bin")).unwrap();
+        let binary = dir.path().join("bin/terraform-ls");
+        fs::write(&binary, "#!/bin/sh\n").unwrap();
+        let (exe, args) = lsp_resolve_server(dir.path(), "terraform").unwrap();
+        assert_eq!(exe, binary.to_string_lossy());
+        assert_eq!(args, ["serve"]);
+    }
+
+    #[test]
+    fn language_server_zip_extracts_deflate_and_rejects_invalid_archives() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut archive = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        archive.start_file("terraform-ls", options).unwrap();
+        archive.write_all(b"test server").unwrap();
+        let bytes = archive.finish().unwrap().into_inner();
+        lsp_unpack_zip(&bytes, dir.path()).unwrap();
+        assert_eq!(fs::read(dir.path().join("terraform-ls")).unwrap(), b"test server");
+        assert!(lsp_unpack_zip(b"not a zip", dir.path()).is_err());
+    }
+
+    #[test]
+    fn language_server_zip_cannot_write_outside_staging() {
+        let dir = tempfile::tempdir().unwrap();
+        let staging = dir.path().join("staging");
+        fs::create_dir(&staging).unwrap();
+        let mut archive = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        archive.start_file("../escape", zip::write::SimpleFileOptions::default()).unwrap();
+        archive.write_all(b"outside").unwrap();
+        let bytes = archive.finish().unwrap().into_inner();
+        let _ = lsp_unpack_zip(&bytes, &staging);
+        assert!(!dir.path().join("escape").exists());
+    }
+
+    #[test]
     fn a_project_setting_is_layered_over_termics_own_answer() {
         // The user's block wins, key by key, without erasing the interpreter
         // termic worked out. Getting this wrong is silent: pyright would
@@ -24440,7 +24537,7 @@ mod tests {
         // A pin with an empty digest would download and run an unverified
         // binary against the user's source. The shape is checked here because
         // the list is edited by hand on every upstream release.
-        for lang in ["typescript", "python", "rust"] {
+        for lang in ["typescript", "python", "rust", "terraform"] {
             let spec = lsp_install_spec(lang)
                 .unwrap_or_else(|| panic!("no pinned server for {lang} on this platform"));
             assert_eq!(spec.sha256.len(), 64, "{lang}: not a sha256");
@@ -24452,7 +24549,7 @@ mod tests {
             assert!(!spec.url.contains("/latest/"), "{lang}: unpinned url");
             assert!(spec.url.contains(spec.version), "{lang}: url does not carry the pinned version");
             assert!(spec.bytes > 1_000_000, "{lang}: implausible size");
-            assert!(matches!(spec.archive, "gz" | "tar.gz"), "{lang}: unknown archive kind");
+            assert!(matches!(spec.archive, "gz" | "tar.gz" | "zip"), "{lang}: unknown archive kind");
             if spec.archive == "gz" {
                 assert!(spec.exe_in_archive.is_empty(), "{lang}: a bare gz has no inner path");
             } else {

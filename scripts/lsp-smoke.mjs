@@ -44,7 +44,10 @@ const onPath = (exe) => (process.env.PATH ?? "").split(":")
   .map(d => d && path.join(d, exe)).find(p => p && existsSync(p)) ?? null;
 
 const installed = (rel) => {
-  const p = path.join(process.env.HOME ?? "", "Library/Application Support/termic/servers", rel);
+  const home = process.env.HOME ?? "";
+  const data = process.platform === "darwin" ? path.join(home, "Library/Application Support")
+    : process.env.XDG_DATA_HOME || path.join(home, ".local/share");
+  const p = path.join(process.env.TERMIC_DATA_DIR || path.join(data, "termic"), "servers", rel);
   return existsSync(p) ? p : null;
 };
 
@@ -88,12 +91,28 @@ function resolveServer(lang, root) {
       const exe = local("bin/ruby-lsp") ?? local(".bundle/bin/ruby-lsp") ?? onPath("ruby-lsp");
       return exe ? [exe, []] : null;
     }
+    case "terraform": {
+      const exe = local("bin/terraform-ls") ?? onPath("terraform-ls")
+        ?? installed("terraform/0.39.0/terraform-ls");
+      return exe ? [exe, ["serve"]] : null;
+    }
     default: return null;
   }
 }
 
 /** What each language's fixture looks like, and what a correct answer is. */
 const CASES = {
+  terraform: {
+    root: path.join(projects, "terraform"),
+    languageId: "terraform",
+    use: { file: "main.tf", line: 2, col: 16, name: "Store" },
+    definedIn: "variables.tf",
+    broken: "broken.tf",
+    undefinedName: "this_name_does_not_exist",
+    // terraform-ls names symbols after their HCL block, not the traversal
+    // (`var.Store`) used in an expression.
+    symbolQuery: 'variable "Store"',
+  },
   typescript: {
     root: path.join(projects, "typescript"),
     languageId: "typescript",

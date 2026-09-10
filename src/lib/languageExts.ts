@@ -38,6 +38,8 @@ function stream(mode: Parameters<typeof StreamLanguage.define>[0]): LanguageSupp
  *    blocks and every `<script>` in the file.
  *  - Astro   — no CodeMirror grammar exists anywhere. `lib/astroMode` builds
  *    one out of the two parsers the file is actually made of.
+ *  - Terraform / HCL — absent. Separate names let .tfvars use its own LSP
+ *    language id without sending unrelated HCL files to terraform-ls.
  *
  *  React and Vue need nothing here: the registry's JSX / TSX and Vue entries
  *  are real grammars, and Vue's loads `@codemirror/lang-vue`.
@@ -45,6 +47,14 @@ function stream(mode: Parameters<typeof StreamLanguage.define>[0]): LanguageSupp
  *  Every loader is a dynamic import, so a grammar costs nothing until a file
  *  that needs it is opened. */
 const CUSTOM: LanguageDescription[] = [
+  ...[
+    { name: "Terraform", extensions: ["tf"] },
+    { name: "Terraform Variables", extensions: ["tfvars"] },
+    { name: "HCL", extensions: ["hcl"] },
+  ].map(spec => LanguageDescription.of({
+    ...spec,
+    load: () => import("codemirror-lang-hcl").then(m => m.hcl()),
+  })),
   LanguageDescription.of({
     name: "Makefile",
     alias: ["make", "bsdmake"],

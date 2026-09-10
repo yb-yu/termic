@@ -43,10 +43,10 @@ settings: {}         initializationOptions: {}
 
 What it buys, in order of how much it matters:
 
-- **Any language, not seven.** termic serves TypeScript, Python, Rust, Go, the
-  C family, Swift and Ruby, because those are the arms in a `match` in
-  `lib.rs`. Adding the last three took an afternoon each, which is the point:
-  it is cheap for US and impossible for a USER. Someone who writes Elixir,
+- **Any language, not a closed list.** termic serves TypeScript, Python, Rust,
+  Go, the C family, Swift, Ruby and Terraform, because those are the arms in a
+  `match` in `lib.rs`. Adding C, Swift and Ruby took an afternoon each, which
+  is the point: it is cheap for US and impossible for a USER. Someone who writes Elixir,
   Java, PHP or Zig gets nothing and can do nothing about it. With a registry
   they add a command and it works, without waiting for a release.
 
@@ -58,7 +58,7 @@ What it buys, in order of how much it matters:
   **The rest is PARKED, deliberately, until somebody asks.** A custom command
   per language shipped too (rule 16b in [../lsp.md](../lsp.md)), which covers
   "I want to run pylsp" without opening the closed set. What is left is a new
-  language SLOT: an eighth language needs its extensions, its LSP `languageId`,
+  language SLOT: another language needs its extensions, its LSP `languageId`,
   its detection markers, a display name, a measured memory figure and a catalog
   row, and each of those is a place where "a language termic knows nothing
   about" has to read as deliberate rather than broken. That is two to three

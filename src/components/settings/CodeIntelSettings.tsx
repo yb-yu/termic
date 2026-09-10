@@ -8,7 +8,7 @@ import { serverGuide, parseRaw, type ServerGuide } from "@/lib/lsp/serverSetting
 import { SERVABLE_LANGUAGES } from "@/lib/lsp/serverNames";
 import { cn } from "@/lib/utils";
 
-/** The same seven the project's own language list uses: a per-language
+/** The same set the project's own language list uses: a per-language
  *  settings panel that knows about four of them is the drift this replaced. */
 const CODE_INTEL_LANGUAGES = SERVABLE_LANGUAGES;
 

@@ -8,6 +8,16 @@ import { PLAIN_TEXT } from "./languages";
 const id = languageIdForPath;
 
 describe("languageIdForPath", () => {
+  it("distinguishes Terraform, variable files and unrelated HCL or JSON", () => {
+    expect(id("infra/main.tf")).toBe("Terraform");
+    expect(id("infra/dev.auto.tfvars")).toBe("Terraform Variables");
+    expect(id("MAIN.TF")).toBe("Terraform");
+    expect(id("terragrunt.hcl")).toBe("HCL");
+    expect(id("image.pkr.hcl")).toBe("HCL");
+    expect(id("main.tf.json")).toBe("JSON");
+    expect(id("dev.tfvars.json")).toBe("JSON");
+  });
+
   it("matches by extension", () => {
     expect(id("src/main.ts")).toBe("TypeScript");
     expect(id("build.js")).toBe("JavaScript");
@@ -136,6 +146,9 @@ describe("the composed list", () => {
 
 describe("langForId", () => {
   it("loads a grammar for a name", async () => {
+    expect(await langForId("Terraform")).not.toBeNull();
+    expect(await langForId("Terraform Variables")).not.toBeNull();
+    expect(await langForId("HCL")).not.toBeNull();
     expect(await langForId("JSON")).not.toBeNull();
     expect(await langForId("Makefile")).not.toBeNull();
     expect(await langForId("markdown")).not.toBeNull(); // legacy id, translated

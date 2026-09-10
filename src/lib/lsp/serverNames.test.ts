@@ -13,7 +13,7 @@ describe("a language with nothing resolved yet", () => {
     // The chip and the consent prompt look the memory note up BY SERVER NAME,
     // so a language that falls back to its own id ("cpp") finds nothing and
     // discloses an empty string.
-    for (const language of ["typescript", "python", "rust", "go", "cpp", "swift", "ruby"]) {
+    for (const language of SERVABLE_LANGUAGE_IDS) {
       const name = serverFor(null, language);
       expect(name, language).not.toBe(language);
       expect(MEMORY_NOTE[name], language).toBeTruthy();

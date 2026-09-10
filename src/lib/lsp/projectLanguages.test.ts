@@ -6,6 +6,15 @@ import { languagesPresent, projectLanguages } from "./projectLanguages";
 // dialog offer the right server anyway.
 
 describe("what is this project written in", () => {
+  it("detects Terraform without treating every HCL or JSON file as Terraform", () => {
+    expect(projectLanguages([".terraform.lock.hcl", "main.tf"])).toEqual(["terraform"]);
+    expect(projectLanguages(["main.tf", "variables.tf", "dev.tfvars"])).toEqual(["terraform"]);
+    expect(languagesPresent(["infra/main.tf"])).toEqual(["terraform"]);
+    expect(languagesPresent(["dev.auto.tfvars"])).toEqual(["terraform"]);
+    expect(languagesPresent(["terragrunt.hcl", "image.pkr.hcl", "main.tf.json", "dev.tfvars.json"]))
+      .toEqual([]);
+  });
+
   it("takes a root manifest as a statement of intent", () => {
     // One script does not make a Python project; `pyproject.toml` does, and
     // that is the answer even when the file count disagrees.

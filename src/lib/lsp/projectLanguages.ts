@@ -39,6 +39,7 @@ const MARKERS: Record<string, string> = {
   "Package.swift": "swift",
   Gemfile: "ruby",
   ".ruby-version": "ruby",
+  ".terraform.lock.hcl": "terraform",
 };
 
 /** Extension → server id, for the counting half. */
@@ -52,6 +53,7 @@ const EXTENSIONS: Record<string, string> = {
   m: "cpp", mm: "cpp",
   swift: "swift",
   rb: "ruby", rake: "ruby",
+  tf: "terraform", tfvars: "terraform",
 };
 
 /** Below this a language is incidental: one `.py` helper in a TypeScript repo

@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import { readdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { KIND_LABEL, keepMatching, preferDefinitions, rankSymbols, type SymbolHit } from "./symbolSearch";
+import { SERVERS } from "./languages";
 
 // The same pipeline searchSymbols runs, over answers RECORDED FROM THE REAL
 // SERVERS rather than invented ones.
@@ -196,7 +197,7 @@ describe("nothing reaches the list that the query cannot explain", () => {
 // server on a fixture project small enough to reason about. These are thinner
 // than the captures above (a two-file project answers with a handful of
 // symbols, not ninety-five), and they are here for BREADTH rather than depth:
-// seven servers now feed this pipeline, each with its own idea of what a
+// these servers feed this pipeline, each with its own idea of what a
 // workspace symbol is, and the invariant a reader depends on is the same for
 // all of them.
 describe("every server termic ships, over its recorded answer", () => {
@@ -204,10 +205,10 @@ describe("every server termic ships, over its recorded answer", () => {
     .filter(f => f.startsWith("symbols.smoke-"))
     .map(f => f.replace(/^symbols\.|\.json$/g, ""));
 
-  it("has a recording for each of the seven languages", () => {
+  it("has a recording for every supported language", () => {
     // A missing one means somebody added a language and never ran the smoke
     // harness against it, which is exactly the gap this file exists to close.
-    expect(names.length).toBe(7);
+    expect(names.map(n => n.replace(/^smoke-/, "")).sort()).toEqual([...SERVERS].sort());
   });
 
   for (const name of names) {
