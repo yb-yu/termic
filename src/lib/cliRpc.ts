@@ -41,6 +41,7 @@ import {
   taskRename,
   taskSetAccount,
   taskSetYolo,
+  taskUpdateMembers,
   tasksList,
   taskLinkSpawn,
   taskGroupJoin,
@@ -71,7 +72,7 @@ import { slugify } from "@/lib/utils";
 import { checkoutTaskName, remoteNames } from "@/lib/existingBranch";
 import { padHandler } from "@/lib/scratchCli";
 import { scheduleHandler } from "@/lib/scheduleCli";
-import type { SandboxMode, Task, TerminalTab } from "@/lib/types";
+import type { CreateMultiMember, SandboxMode, Task, TerminalTab } from "@/lib/types";
 import {
   collectTaskProps, propKeyProblem, propValueProblem, PROP_KEYS_PER_TAB, type CollectedProp,
 } from "@/lib/tabProps";
@@ -845,6 +846,37 @@ async function renameTaskHandler(params: unknown): Promise<null> {
   return null;
 }
 
+// ─────────────────────────── members ─────────────────────────────────
+
+/** `termic members --add/--remove` (v24): the Edit Task dialog's member
+ *  save. The server already resolved names to `add` root_paths and `remove`
+ *  dir_names and dropped what the task has; this builds the specs exactly
+ *  as the dialog does, branch and base left to Rust's fallbacks. */
+async function updateTaskMembersHandler(params: unknown): Promise<null> {
+  const p = params as { taskId?: unknown; add?: unknown; remove?: unknown };
+  const taskId = p?.taskId;
+  if (typeof taskId !== "string" || !taskId) throw new Error("update_task_members requires a taskId");
+  const add: string[] = Array.isArray(p.add) ? p.add : [];
+  const remove: string[] = Array.isArray(p.remove) ? p.remove : [];
+  if (!useApp.getState().tasks.some(t => t.id === taskId)) await useApp.getState().loadAll();
+  const s = useApp.getState();
+  const task = s.tasks.find(t => t.id === taskId);
+  if (!task) throw new Error("no such task");
+  const known = s.projects.find(pr => pr.id === task.project_id)?.members ?? [];
+  // A main checkout can only link, and a plain-folder member has no branches.
+  const specs: CreateMultiMember[] = add.map(root_path => ({
+    root_path,
+    mode: task.is_main_checkout || known.find(m => m.root_path === root_path)?.non_git ? "repo_root" : "worktree",
+  }));
+  try {
+    await taskUpdateMembers(taskId, specs, remove);
+  } finally {
+    // Per-member best-effort: what landed before an error is real.
+    await useApp.getState().loadAll().catch(() => {});
+  }
+  return null;
+}
+
 /** `termic group --name/--color` (and MCP `task_group`). A key that is ABSENT
  *  leaves that property as it is; `name: ""` returns the group to following
  *  its lead's name. A task in no group founds a group of one around itself
@@ -1471,6 +1503,7 @@ const handlers: Record<string, Handler> = {
   send_prompt: sendPromptHandler,
   archive_task: archiveTaskHandler,
   rename_task: renameTaskHandler,
+  update_task_members: updateTaskMembersHandler,
   set_task_group: setTaskGroupHandler,
   pad: padHandler,
   schedule: scheduleHandler,

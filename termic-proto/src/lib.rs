@@ -119,8 +119,9 @@ use std::io::{self, BufRead, Read, Write};
 /// v24: `new` gains `members`, the member repos of a multi-repo project the
 /// task worktrees (or, in the main checkout, links). A v23 server would drop
 /// the field and create a task with no member worktrees, or with every
-/// member linked, which reads as success. `project list` reports each
-/// project's `type` and members.
+/// member linked, which reads as success. The `members` verb lists a
+/// multi-repo task's members and adds or removes them on the live task.
+/// `project list` reports each project's `type` and members.
 pub const PROTOCOL_VERSION: u32 = 24;
 
 /// A pasted "123", "#123", "!123" or a PR / MR link, reduced to its number.
@@ -706,6 +707,28 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         leave: bool,
     },
+    /// v24: list a multi-repo task's member repos, or add and remove them on
+    /// the live task. Member NAMES as typed; the server resolves them
+    /// against the project and sends only the difference from what the task
+    /// already has, so a repeat is a no-op. Neither list = list only.
+    /// cwd-aware when `task` absent.
+    Members {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        add: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        remove: Vec<String>,
+        /// Remove a worktree member even when it has uncommitted changes,
+        /// which the removal discards. Absent (a typo'd field included)
+        /// is the refusing direction.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        yes: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+    },
     /// List a task's scratchpads. cwd-aware when `task` absent.
     PadList {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1090,6 +1113,8 @@ pub enum ReplyData {
     Archive(ArchiveData),
     Rename(RenameData),
     Group(GroupData),
+    /// `members` (v24).
+    Members(MembersData),
     Pad(PadData),
     ProjectList(ProjectListData),
     ProjectAdd(ProjectAddData),
@@ -1434,6 +1459,29 @@ pub struct GroupData {
     /// Its group after the call, or none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<TaskGroupInfo>,
+}
+
+/// One member repo of a multi-repo task, as `members` reports it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct MemberInfo {
+    /// The project's name for the member: what `--add` / `--remove` take.
+    pub name: String,
+    /// Its directory inside the task (`<task path>/<dir_name>`).
+    pub dir_name: String,
+    /// "worktree" (its own worktree on `branch`) or "repo_root" (a link to
+    /// the member's live checkout).
+    pub mode: String,
+    /// Empty for "repo_root".
+    pub branch: String,
+    /// Where the member's files are: the worktree, or the live checkout.
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MembersData {
+    /// The task after the call, re-read from disk.
+    pub task: TaskSummary,
+    pub members: Vec<MemberInfo>,
 }
 
 /// One scratchpad, as `pad list` and every other pad verb report it.
@@ -2502,6 +2550,23 @@ mod tests {
                 name: "retitled".into(),
                 cwd: Some("/tasks/web/x".into()),
             },
+            Command::Members {
+                task: Some("fix-auth".into()),
+                project: Some("shop".into()),
+                add: vec!["web".into(), "Docs".into()],
+                remove: vec!["api".into()],
+                yes: true,
+                cwd: None,
+            },
+            // List only, from the cwd.
+            Command::Members {
+                task: None,
+                project: None,
+                add: Vec::new(),
+                remove: Vec::new(),
+                yes: false,
+                cwd: Some("/tasks/shop/x/api".into()),
+            },
             Command::PadList { task: None, project: None, scope: None, cwd: Some("/tasks/web/x".into()) },
             Command::PadNew {
                 task: Some("fix-auth".into()),
@@ -2929,6 +2994,25 @@ mod tests {
             ReplyData::Rename(RenameData {
                 task: summary.clone(),
                 old_name: "fix-auth".into(),
+            }),
+            ReplyData::Members(MembersData {
+                task: summary.clone(),
+                members: vec![
+                    MemberInfo {
+                        name: "api".into(),
+                        dir_name: "api".into(),
+                        mode: "worktree".into(),
+                        branch: "fix-auth".into(),
+                        path: "/Users/x/termic/tasks/web/fix-auth/api".into(),
+                    },
+                    MemberInfo {
+                        name: "docs".into(),
+                        dir_name: "docs".into(),
+                        mode: "repo_root".into(),
+                        branch: String::new(),
+                        path: "/src/docs".into(),
+                    },
+                ],
             }),
             ReplyData::ProjectList(ProjectListData {
                 projects: vec![

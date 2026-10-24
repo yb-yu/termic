@@ -274,7 +274,7 @@ fn call_budget(cmd: &Command) -> Duration {
         (Some(ms), _) => {
             Duration::from_millis(ms.min(crate::mcp_server::MCP_WAIT_CAP_MS)) + SLOW_CALL_TIMEOUT
         }
-        (None, Command::Archive { .. } | Command::New { .. } | Command::ScheduleDelete { .. }) => {
+        (None, Command::Archive { .. } | Command::New { .. } | Command::Members { .. } | Command::ScheduleDelete { .. }) => {
             SLOW_CALL_TIMEOUT
         }
         _ => CALL_TIMEOUT,

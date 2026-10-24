@@ -1314,6 +1314,55 @@ Exit codes: 0 ok, 1 error (unknown task, unknown colour, archived task, \
         leave: bool,
     },
 
+    /// List a multi-repo task's member repos, or add and remove them.
+    #[command(
+        after_help = "A multi-repo task holds some of its project's member repos. Without \
+--add or --remove, prints each one: its name, mode (worktree: its own worktree \
+on the task branch; repo_root: a link to the member's live checkout), branch \
+and path, the directory its files are in.
+
+--add <NAME> adds a project member to the live task, the way the Edit Task \
+dialog does: a worktree on the task branch, or a link in a main-checkout task \
+or for a plain-folder member. --remove <NAME> takes one out. Repeat either for \
+more; names are the project's members, case-insensitive, and an unknown one \
+fails before anything changes, listing them. Both converge: adding a member \
+the task has, or removing one it does not, does nothing, so a repeat is safe.
+
+Removing a worktree member deletes its directory: uncommitted and untracked \
+files there are lost, while its branch and commits stay in the member repo. A \
+worktree with uncommitted changes is refused unless --yes. A clean worktree, \
+or a link (which only unlinks), needs no --yes.
+
+Without <TASK>, targets your own task ($TERMIC_TASK_ID), then the current \
+directory.
+
+Prints the members after the call. With --output-format json, one object: \
+{\"task\": {...}, \"members\": [{\"name\", \"dir_name\", \"mode\", \"branch\", \
+\"path\"}]}.
+
+Exit codes: 0 ok, 1 error (unknown or ambiguous task, not a multi-repo task, \
+unknown member, uncommitted changes without --yes, a member that failed to \
+add or remove), 4 app not running, 5 CLI disabled, 6 refused, 8 connection \
+lost."
+    )]
+    Members {
+        /// Task name, task id, or qualified project/name. Omitted:
+        /// $TERMIC_TASK_ID, then the current directory.
+        task: Option<String>,
+        /// Project name, to disambiguate. Requires a task name.
+        #[arg(long, requires = "task")]
+        project: Option<String>,
+        /// A project member to add, by name. Repeat for more.
+        #[arg(long = "add", value_name = "NAME")]
+        add: Vec<String>,
+        /// A member to remove, by name. Repeat for more.
+        #[arg(long = "remove", value_name = "NAME")]
+        remove: Vec<String>,
+        /// Remove worktrees with uncommitted changes anyway, discarding them.
+        #[arg(short, long)]
+        yes: bool,
+    },
+
     /// Archive a task: SIGKILL its live agents, remove its worktree.
     #[command(
         after_help = "Kills the task's live agent PTYs FIRST, then archives: the worktree \
@@ -2453,6 +2502,28 @@ outside.",
                     caller_task: parent_task_from_env(),
                     join: join.clone(),
                     leave: *leave,
+                },
+                &token,
+            )?;
+            render(&cli.cmd, format, data).map(Output::ok)
+        }
+        Cmd::Members { task, project, add, remove, yes } => {
+            // An add cuts a worktree per member and fetches its base (server
+            // budget 180s); the default 30s would report a false "connection
+            // lost" on a big repo.
+            if !add.is_empty() || !remove.is_empty() {
+                conn.set_read_timeout(client::SLOW_VERB_READ_TIMEOUT);
+            }
+            let data = client::request(
+                &mut conn,
+                proto::Command::Members {
+                    // Same target rule as rename.
+                    task: task.clone().or_else(|| own_env("TERMIC_TASK_ID")),
+                    project: project.clone(),
+                    add: add.clone(),
+                    remove: remove.clone(),
+                    yes: *yes,
+                    cwd: std::env::current_dir().ok().map(|p| p.to_string_lossy().into_owned()),
                 },
                 &token,
             )?;
@@ -3840,6 +3911,11 @@ pub fn render(cmd: &Cmd, format: OutputFormat, data: proto::ReplyData) -> Result
             OutputFormat::Text => output::group_text(&g),
         }),
         (Cmd::Group { .. }, _) => Err(unexpected("group")),
+        (Cmd::Members { .. }, proto::ReplyData::Members(m)) => Ok(match format {
+            OutputFormat::Json | OutputFormat::StreamJson => output::json(&m),
+            OutputFormat::Text => output::members_text(&m),
+        }),
+        (Cmd::Members { .. }, _) => Err(unexpected("members")),
         (Cmd::Prop { value, .. }, proto::ReplyData::Prop(p)) => Ok(match format {
             OutputFormat::Json | OutputFormat::StreamJson => output::json(&p),
             OutputFormat::Text => output::prop_text(&p, value.is_some()),
@@ -3981,6 +4057,26 @@ mod tests {
         }
         let Cmd::New { members, .. } = Cli::try_parse_from(["termic", "new", "x"]).unwrap().cmd else { panic!() };
         assert!(members.is_empty());
+    }
+
+    #[test]
+    fn members_flag_rules() {
+        let cli = Cli::try_parse_from([
+            "termic", "members", "feat", "--project", "shop", "--add", "web", "--add", "Docs",
+            "--remove", "api", "-y",
+        ])
+        .unwrap();
+        let Cmd::Members { task, project, add, remove, yes } = cli.cmd else { panic!() };
+        assert_eq!((task.as_deref(), project.as_deref()), (Some("feat"), Some("shop")));
+        assert_eq!((add, remove), (vec!["web".to_string(), "Docs".into()], vec!["api".to_string()]));
+        assert!(yes);
+        // No flags lists; no task resolves the caller's own.
+        let Cmd::Members { task, add, remove, yes, .. } = Cli::try_parse_from(["termic", "members"]).unwrap().cmd
+        else {
+            panic!()
+        };
+        assert!(task.is_none() && add.is_empty() && remove.is_empty() && !yes);
+        assert!(Cli::try_parse_from(["termic", "members", "--project", "shop"]).is_err(), "--project needs a task");
     }
 
     #[test]
@@ -4643,6 +4739,7 @@ mod tests {
             "scratchpad list", "scratchpad new", "scratchpad write", "scratchpad read",
             "scratchpad rm", "scratchpad clear",
             "schedule list", "schedule show", "schedule set", "schedule run", "schedule delete",
+            "members",
         ] {
             assert!(names.contains(&expected), "missing {expected} in {names:?}");
         }

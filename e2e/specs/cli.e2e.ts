@@ -1322,6 +1322,76 @@ describe("termic new --member: only the named members of a multi-repo task", () 
     expect(list.data.tasks.some((t: any) => t.name === "cli-multi-typo")).toBe(false);
     expect(gitIn(repo("alpha"), "branch --list \"*cli-multi-typo*\"")).toBe("");
   });
+
+  // `termic members` (proto v24) on the same fixture: a live task's members
+  // listed, added and removed through the real sidecar, and the guard that
+  // keeps a remove from deleting uncommitted work.
+  describe("termic members: a live task's members, listed and changed", () => {
+    const TASK = "cli-multi-members";
+    const members = (...args: string[]) =>
+      JSON.parse(runCli(["--no-launch", "--json", "members", TASK, "--project", PROJECT, ...args],
+        { TERMIC_DATA_DIR: dataDir }));
+    const failure = (...args: string[]) => {
+      try {
+        members(...args);
+      } catch (e) {
+        return (e as Error).message;
+      }
+      throw new Error(`members ${args.join(" ")} succeeded`);
+    };
+    const dirs = () => stored(taskId).composition.map((m: any) => m.dir_name);
+    const memberPath = (dir: string) => stored(taskId).composition.find((m: any) => m.dir_name === dir).path;
+    let taskId = "";
+    let branch = "";
+
+    before(() => {
+      taskId = JSON.parse(cli(TASK, "--member", "alpha")).task.id;
+      branch = stored(taskId).branch;
+    });
+
+    it("--add worktrees a member on the task branch and lists both with their paths", () => {
+      const out = members("--add", "beta");
+      expect(out.task.id).toBe(taskId);
+      expect(out.members.map((m: any) => [m.name, m.mode, m.branch])).toEqual([
+        ["alpha", "worktree", branch],
+        ["beta", "worktree", branch],
+      ]);
+      // A real worktree of beta at the listed path, not its live checkout.
+      const beta = out.members[1].path;
+      expect(fs.realpathSync(beta)).not.toBe(fs.realpathSync(repo("beta")));
+      expect(gitIn(beta, "rev-parse --abbrev-ref HEAD")).toBe(branch);
+      expect(dirs()).toEqual(["alpha", "beta"]);
+      // Listing reads the same record, and a repeat add changes nothing.
+      expect(members().members).toEqual(out.members);
+      expect(members("--add", "BETA").members).toEqual(out.members);
+    });
+
+    it("refuses to remove a worktree with uncommitted changes without --yes", () => {
+      const wip = path.join(memberPath("beta"), "wip.txt");
+      fs.writeFileSync(wip, "unsaved\n");
+      const err = failure("--remove", "beta");
+      expect(err).toContain("exit 1");
+      expect(err).toContain("beta has 1 uncommitted change");
+      expect(err).toContain("--yes");
+      expect(fs.existsSync(wip)).toBe(true);
+      expect(dirs()).toEqual(["alpha", "beta"]);
+    });
+
+    it("--yes removes it, and its task branch stays in the member repo", () => {
+      const beta = memberPath("beta");
+      const out = members("--remove", "beta", "--yes");
+      expect(out.members.map((m: any) => m.name)).toEqual(["alpha"]);
+      expect(fs.existsSync(beta)).toBe(false);
+      expect(gitIn(repo("beta"), `branch --list ${JSON.stringify(branch)}`)).not.toBe("");
+    });
+
+    it("removes a clean worktree without --yes", () => {
+      const alpha = memberPath("alpha");
+      expect(members("--remove", "alpha").members).toEqual([]);
+      expect(fs.existsSync(alpha)).toBe(false);
+      expect(dirs()).toEqual([]);
+    });
+  });
 });
 
 describe("termic new task parameters (GH #287)", () => {

@@ -930,6 +930,7 @@ pub(crate) fn dispatch_authenticated(
             &req.id, host, task.as_deref(), project.as_deref(), cwd.as_deref(),
             name.as_deref(), color.as_deref(), caller_task.as_deref(), join.as_deref(), *leave,
         ),
+        Command::Members { .. } => handle_members(req, host),
         Command::PadList { task, project, scope, cwd } => handle_pad(
             &req.id, host, task.as_deref(), project.as_deref(), scope.as_deref(), cwd.as_deref(),
             serde_json::json!({ "op": "list" }),
@@ -3681,6 +3682,159 @@ fn handle_group(
     )
 }
 
+// ───────────────────────────── members ───────────────────────────────
+
+/// The project member a composition entry belongs to: the backend's
+/// `member_repo` rule, plus the Edit Task dialog's fallback for a legacy
+/// entry whose repo no longer resolves (the member its dir is named after).
+fn composition_member<'a>(
+    proj: &'a Project,
+    m: &crate::TaskMember,
+    projects: &[Project],
+) -> Option<&'a crate::ProjectMember> {
+    match crate::member_repo(m, projects) {
+        Some(root) => proj.members.iter().find(|pm| pm.root_path == root),
+        None => proj.members.iter().find(|pm| pm.name == m.dir_name),
+    }
+}
+
+fn members_data(task: &Task, projects: &[Project], tasks: &[Task]) -> proto::MembersData {
+    let proj = projects.iter().find(|p| p.id == task.project_id);
+    let members = task
+        .composition
+        .iter()
+        .map(|m| proto::MemberInfo {
+            name: proj
+                .and_then(|p| composition_member(p, m, projects))
+                .map_or_else(|| m.dir_name.clone(), |pm| pm.name.clone()),
+            dir_name: m.dir_name.clone(),
+            mode: match m.mode {
+                crate::MemberMode::Worktree => "worktree",
+                crate::MemberMode::RepoRoot => "repo_root",
+            }
+            .into(),
+            branch: m.branch.clone(),
+            path: m.path.clone(),
+        })
+        .collect();
+    proto::MembersData { task: summarize(task, projects, tasks, None, None), members }
+}
+
+/// `git status --porcelain` entries in a member worktree. A dir that is
+/// already gone has nothing to lose.
+fn uncommitted_entries(path: &str) -> Result<usize, String> {
+    let p = Path::new(path);
+    if !p.exists() {
+        return Ok(0);
+    }
+    crate::git(&["status", "--porcelain"], p)
+        .map(|out| out.lines().filter(|l| !l.trim().is_empty()).count())
+        .map_err(|e| e.to_string())
+}
+
+/// `members` (v24): list a multi-repo task's members, or converge them on
+/// the names asked for. Everything is checked against the disk-read task
+/// before the webview's `update_task_members` RPC (the Edit Task dialog's
+/// `task_update_members`) is sent only the difference: a member already
+/// there is not re-added, one already gone is not re-removed.
+fn handle_members(req: &Request, host: &dyn CliHost) -> Reply {
+    let Command::Members { task, project, add, remove, yes, cwd } = &req.cmd else {
+        unreachable!("handle_members called with a non-members command")
+    };
+    let id = &req.id;
+    let (projects, tasks) = host.projects_tasks();
+    let t = match resolve_task_arg(&projects, &tasks, task.as_deref(), project.as_deref(), cwd.as_deref()) {
+        Ok(t) => t.clone(),
+        Err(e) => return Reply { id: id.clone(), ok: false, data: None, error: Some(e) },
+    };
+    let Some(proj) = projects
+        .iter()
+        .find(|p| p.id == t.project_id && p.project_type == crate::ProjectType::Multi)
+    else {
+        return Reply::err(
+            id,
+            ErrorCode::BadRequest,
+            format!("{} is not a multi-repo task; only multi-repo tasks have members", qualified(&projects, &t)),
+        );
+    };
+    let (add_roots, remove_roots) = match (resolve_new_members(proj, add), resolve_new_members(proj, remove)) {
+        (Ok(a), Ok(r)) => (a, r),
+        (Err(e), _) | (_, Err(e)) => return Reply { id: id.clone(), ok: false, data: None, error: Some(e) },
+    };
+    if let Some(m) = proj.members.iter().find(|m| add_roots.contains(&m.root_path) && remove_roots.contains(&m.root_path)) {
+        return Reply::err(id, ErrorCode::BadRequest, format!("\"{}\" is both added and removed; pass it once", m.name));
+    }
+    let root_of = |m: &crate::TaskMember| composition_member(proj, m, &projects).map(|pm| pm.root_path.as_str());
+    let to_add: Vec<&String> = add_roots
+        .iter()
+        .filter(|r| !t.composition.iter().any(|m| root_of(m) == Some(r.as_str())))
+        .collect();
+    let to_remove: Vec<&crate::TaskMember> = t
+        .composition
+        .iter()
+        .filter(|m| root_of(m).is_some_and(|r| remove_roots.iter().any(|x| x == r)))
+        .collect();
+
+    // Removing a worktree member is `git worktree remove --force` plus an
+    // rm -rf: its uncommitted and untracked work goes with it (its branch
+    // and commits stay). A link only unlinks, so it loses nothing.
+    if !*yes {
+        let mut dirty = Vec::new();
+        for m in to_remove.iter().filter(|m| m.mode == crate::MemberMode::Worktree) {
+            match uncommitted_entries(&m.path) {
+                Ok(0) => {}
+                Ok(n) => dirty.push(format!(
+                    "{} has {n} uncommitted change{}",
+                    m.dir_name,
+                    if n == 1 { "" } else { "s" }
+                )),
+                Err(e) => {
+                    return Reply::err(
+                        id,
+                        ErrorCode::BadRequest,
+                        format!("could not check {} for uncommitted changes ({e}); pass --yes to remove it anyway", m.dir_name),
+                    )
+                }
+            }
+        }
+        if !dirty.is_empty() {
+            return Reply::err(
+                id,
+                ErrorCode::BadRequest,
+                format!("{}; commit or stash them there, or pass --yes to discard them", dirty.join(", ")),
+            );
+        }
+    }
+
+    if to_add.is_empty() && to_remove.is_empty() {
+        return Reply::ok(id, ReplyData::Members(members_data(&t, &projects, &tasks)));
+    }
+    let remove_dirs: Vec<&str> = to_remove.iter().map(|m| m.dir_name.as_str()).collect();
+    // A create's budget: an add cuts a worktree per member and fetches its base.
+    let sent = host.rpc(
+        "update_task_members",
+        serde_json::json!({ "taskId": t.id, "add": to_add, "remove": remove_dirs }),
+        NEW_TASK_TIMEOUT,
+    );
+    // Re-read from disk either way: the backend is per-member best-effort
+    // and saves what landed before it reports what did not.
+    let (projects, tasks) = host.projects_tasks();
+    let Some(now) = tasks.iter().find(|w| w.id == t.id) else {
+        return Reply::err(id, ErrorCode::Internal, "task disappeared while updating its members");
+    };
+    let data = members_data(now, &projects, &tasks);
+    if let Err(e) = sent {
+        let names: Vec<&str> = data.members.iter().map(|m| m.name.as_str()).collect();
+        let now_has = if names.is_empty() { "no members".to_string() } else { format!("members {}", names.join(", ")) };
+        return Reply::err(
+            id,
+            ErrorCode::Internal,
+            format!("updating members failed ({e}); {} now has {now_has}", qualified(&projects, now)),
+        );
+    }
+    Reply::ok(id, ReplyData::Members(data))
+}
+
 // ───────────────────────────── scratchpads ───────────────────────────
 
 /// Every pad verb: resolve the task here (the same rules every task verb
@@ -6205,6 +6359,12 @@ pub(crate) mod test_support {
         /// reload handle_rename performs sees the persisted rename the
         /// way the real webview's task_rename write would provide it.
         pub(crate) renames: Mutex<HashMap<String, String>>,
+        /// The composition an `update_task_members` rpc persists (taken by
+        /// the call, success or not), so the reload handle_members performs
+        /// sees what the backend saved.
+        pub(crate) landed_members: Mutex<Option<Vec<crate::TaskMember>>>,
+        /// id -> composition applied by a landed update.
+        pub(crate) compositions: Mutex<HashMap<String, Vec<crate::TaskMember>>>,
         pub(crate) killed: Mutex<Vec<String>>,
         /// (tasks with agents, live agents) the stub reports for `quit`.
         pub(crate) live_agents: (u32, u32),
@@ -6272,6 +6432,8 @@ pub(crate) mod test_support {
                 setup_chunks: Vec::new(),
                 extra_tasks: Mutex::new(Vec::new()),
                 renames: Mutex::new(HashMap::new()),
+                landed_members: Mutex::new(None),
+                compositions: Mutex::new(HashMap::new()),
                 killed: Mutex::new(Vec::new()),
                 ops: Mutex::new(Vec::new()),
                 cache: AgentCache::new(),
@@ -6323,9 +6485,13 @@ pub(crate) mod test_support {
             let mut tasks = self.tasks.clone();
             tasks.extend(self.extra_tasks.lock().unwrap().iter().cloned());
             let renames = self.renames.lock().unwrap();
+            let compositions = self.compositions.lock().unwrap();
             for t in &mut tasks {
                 if let Some(n) = renames.get(&t.id) {
                     t.name = n.clone();
+                }
+                if let Some(c) = compositions.get(&t.id) {
+                    t.composition = c.clone();
                 }
             }
             (self.projects.clone(), tasks)
@@ -6380,6 +6546,13 @@ pub(crate) mod test_support {
                     ) {
                         self.renames.lock().unwrap().insert(tid.into(), name.into());
                     }
+                }
+            }
+            if method == "update_task_members" {
+                if let (Some(tid), Some(c)) =
+                    (params.get("taskId").and_then(|t| t.as_str()), self.landed_members.lock().unwrap().take())
+                {
+                    self.compositions.lock().unwrap().insert(tid.into(), c);
                 }
             }
             if method == "new_task" {
@@ -7460,6 +7633,194 @@ mod tests {
             let err = handle(&req(cmd, Some("tok")), &host).error.unwrap();
             assert_eq!(err.code, ErrorCode::BadRequest, "{}", err.message);
         }
+        assert!(host.rpc_calls.lock().unwrap().is_empty());
+    }
+
+    // ── members: list, add and remove on a live task (v24) ───────────
+
+    fn comp(dir: &str, repo: &str, mode: crate::MemberMode, path: &str) -> crate::TaskMember {
+        let branch = if mode == crate::MemberMode::Worktree { "feat" } else { "" };
+        crate::TaskMember {
+            repo_path: repo.into(),
+            dir_name: dir.into(),
+            mode,
+            branch: branch.into(),
+            path: path.into(),
+            ..Default::default()
+        }
+    }
+
+    /// `multi_host` plus task mono/feat holding api as a worktree at
+    /// `api_path` and docs linked under the dir "handbook" (a dir named
+    /// apart from its member, so a remove has to map by repo, not name),
+    /// and an archived task mono/old.
+    fn members_host(api_path: &str, docs_path: &str) -> StubHost {
+        let mut host = multi_host(false);
+        let mut feat = task("m1", "feat", "p3", "/tasks/mono/feat");
+        feat.composition = vec![
+            comp("api", "/src/api", crate::MemberMode::Worktree, api_path),
+            comp("handbook", "/src/docs", crate::MemberMode::RepoRoot, docs_path),
+        ];
+        let mut old = task("m2", "old", "p3", "/tasks/mono/old");
+        old.archived = true;
+        host.tasks.extend([feat, old]);
+        host.script_rpc("update_task_members", Ok(serde_json::Value::Null));
+        host
+    }
+
+    fn members_cmd(task: &str, add: &[&str], remove: &[&str], yes: bool) -> Command {
+        let names = |xs: &[&str]| xs.iter().map(|s| s.to_string()).collect();
+        Command::Members { task: Some(task.into()), project: None, add: names(add), remove: names(remove), yes, cwd: None }
+    }
+
+    fn members_reply(host: &StubHost, cmd: Command) -> proto::MembersData {
+        let reply = handle(&req(cmd, Some("tok")), host);
+        match reply.data {
+            Some(ReplyData::Members(m)) => m,
+            _ => panic!("expected members, got {reply:?}"),
+        }
+    }
+
+    fn members_err(host: &StubHost, cmd: Command) -> proto::ErrorBody {
+        handle(&req(cmd, Some("tok")), host).error.expect("expected a refusal")
+    }
+
+    /// The one `update_task_members` call sent, as (add, remove).
+    fn members_sent(host: &StubHost) -> (serde_json::Value, serde_json::Value) {
+        let calls = host.rpc_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        let (method, params) = &calls[0];
+        assert_eq!(method, "update_task_members");
+        assert_eq!(params["taskId"], "m1");
+        (params["add"].clone(), params["remove"].clone())
+    }
+
+    fn git_repo(dirty: bool) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let ok = std::process::Command::new("git").args(["init", "-q"]).current_dir(dir.path()).status().unwrap().success();
+        assert!(ok, "git init failed");
+        if dirty {
+            std::fs::write(dir.path().join("wip.txt"), "unsaved").unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn members_lists_where_each_member_lives_without_an_rpc() {
+        let host = members_host("/tasks/mono/feat/api", "/src/docs");
+        let m = members_reply(&host, members_cmd("feat", &[], &[], false));
+        assert_eq!(m.task.id, "m1");
+        let rows: Vec<_> = m.members.iter().map(|x| (&*x.name, &*x.dir_name, &*x.mode, &*x.branch, &*x.path)).collect();
+        assert_eq!(
+            rows,
+            [
+                ("api", "api", "worktree", "feat", "/tasks/mono/feat/api"),
+                ("docs", "handbook", "repo_root", "", "/src/docs"),
+            ]
+        );
+        assert!(host.rpc_calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn members_add_sends_only_the_missing_root_paths_and_replies_with_what_landed() {
+        let host = members_host("/tasks/mono/feat/api", "/src/docs");
+        let mut landed = host.tasks.iter().find(|t| t.id == "m1").unwrap().composition.clone();
+        landed.push(comp("Web", "/src/web", crate::MemberMode::Worktree, "/tasks/mono/feat/Web"));
+        *host.landed_members.lock().unwrap() = Some(landed);
+        // api is already there; WEB resolves case-insensitively.
+        let m = members_reply(&host, members_cmd("feat", &["api", "WEB"], &[], false));
+        assert_eq!(members_sent(&host), (serde_json::json!(["/src/web"]), serde_json::json!([])));
+        let names: Vec<_> = m.members.iter().map(|x| x.name.as_str()).collect();
+        assert_eq!(names, ["api", "docs", "Web"], "the reply is the re-read task");
+    }
+
+    #[test]
+    fn members_converge_so_a_repeat_sends_nothing() {
+        let host = members_host("/tasks/mono/feat/api", "/src/docs");
+        // Adding what is there, removing what is not: nothing left to do.
+        let m = members_reply(&host, members_cmd("feat", &["api", "docs"], &["web"], false));
+        assert_eq!(m.members.len(), 2);
+        assert!(host.rpc_calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn members_remove_sends_the_task_dir_of_that_member() {
+        let host = members_host("/tasks/mono/feat/api", "/src/docs");
+        members_reply(&host, members_cmd("feat", &[], &["DOCS"], false));
+        assert_eq!(members_sent(&host), (serde_json::json!([]), serde_json::json!(["handbook"])));
+    }
+
+    #[test]
+    fn members_refusals_fire_before_any_rpc() {
+        let host = members_host("/tasks/mono/feat/api", "/src/docs");
+        for cmd in [members_cmd("feat", &["billing"], &[], false), members_cmd("feat", &[], &["billing"], false)] {
+            let err = members_err(&host, cmd);
+            assert_eq!(err.code, ErrorCode::NotFound);
+            assert!(err.message.contains("\"billing\"") && err.message.contains("api, Web, docs"), "{}", err.message);
+        }
+        let err = members_err(&host, members_cmd("feat", &["web"], &["Web"], false));
+        assert_eq!(err.code, ErrorCode::BadRequest);
+        assert!(err.message.contains("both added and removed"), "{}", err.message);
+        let mut single = members_cmd("solo", &[], &[], false);
+        if let Command::Members { project, .. } = &mut single {
+            *project = Some("web".into());
+        }
+        let err = members_err(&host, single);
+        assert_eq!(err.code, ErrorCode::BadRequest);
+        assert!(err.message.contains("only multi-repo tasks have members"), "{}", err.message);
+        // An archived task is not a live one to edit.
+        assert_eq!(members_err(&host, members_cmd("old", &["web"], &[], false)).code, ErrorCode::NotFound);
+        assert!(host.rpc_calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn members_partial_failure_names_it_and_what_the_task_has_now() {
+        let host = members_host("/tasks/mono/feat/api", "/src/docs");
+        host.script_rpc("update_task_members", Err("member Web worktree add failed: boom".into()));
+        // The backend removed docs, then failed the add, and saved that.
+        *host.landed_members.lock().unwrap() =
+            Some(vec![comp("api", "/src/api", crate::MemberMode::Worktree, "/tasks/mono/feat/api")]);
+        let err = members_err(&host, members_cmd("feat", &["web"], &["docs"], false));
+        assert_eq!(err.code, ErrorCode::Internal);
+        assert!(err.message.contains("boom"), "{}", err.message);
+        assert!(err.message.contains("mono/feat now has members api"), "{}", err.message);
+    }
+
+    #[test]
+    fn members_refuse_to_discard_a_dirty_worktree_without_yes() {
+        let dirty = git_repo(true);
+        let api = dirty.path().to_str().unwrap();
+        let host = members_host(api, "/src/docs");
+        let err = members_err(&host, members_cmd("feat", &[], &["api"], false));
+        assert_eq!(err.code, ErrorCode::BadRequest);
+        assert!(err.message.starts_with("api has 1 uncommitted change;"), "{}", err.message);
+        assert!(err.message.contains("--yes"), "{}", err.message);
+        assert!(host.rpc_calls.lock().unwrap().is_empty());
+        // --yes is the consent to lose it.
+        members_reply(&host, members_cmd("feat", &[], &["api"], true));
+        assert_eq!(members_sent(&host).1, serde_json::json!(["api"]));
+    }
+
+    #[test]
+    fn members_remove_a_clean_worktree_or_any_link_without_yes() {
+        let clean = git_repo(false);
+        let host = members_host(clean.path().to_str().unwrap(), "/src/docs");
+        members_reply(&host, members_cmd("feat", &[], &["api"], false));
+        assert_eq!(members_sent(&host).1, serde_json::json!(["api"]));
+        // A link only unlinks: its live checkout's changes are never checked.
+        let dirty = git_repo(true);
+        let host = members_host("/tasks/mono/feat/api", dirty.path().to_str().unwrap());
+        members_reply(&host, members_cmd("feat", &[], &["docs"], false));
+        assert_eq!(members_sent(&host).1, serde_json::json!(["handbook"]));
+    }
+
+    #[test]
+    fn members_refuse_a_worktree_git_cannot_read_without_yes() {
+        // Teardown deletes whatever is in the dir, so "cannot tell" refuses.
+        let plain = tempfile::tempdir().unwrap();
+        let host = members_host(plain.path().to_str().unwrap(), "/src/docs");
+        let err = members_err(&host, members_cmd("feat", &[], &["api"], false));
+        assert!(err.message.contains("could not check api"), "{}", err.message);
         assert!(host.rpc_calls.lock().unwrap().is_empty());
     }
 

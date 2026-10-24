@@ -3,7 +3,7 @@
 //! CLI output.
 
 use serde::Serialize;
-use termic_proto::{GroupData, PeerInfo, PeerPairData, PeersData, 
+use termic_proto::{GroupData, MembersData, PeerInfo, PeerPairData, PeersData,
     send_mode, AgentsData, ApplyData, ArchiveData, DiffData, DiffStat, NewData, OpenData,
     ProjectInfo, ProjectRemoveData, PromptEntry, QuitData, RenameData, ResultData, SendData,
     StreamEvent, TabCloseData, TabData, TabStatus, TaskStatus, TaskSummary, WaitData, WaitOutcome,
@@ -246,6 +246,28 @@ pub fn group_text(d: &GroupData) -> String {
         lines.push(format!("  members: {}", g.members.join(", ")));
     }
     lines.join("\n")
+}
+
+/// `members`: one row per member, `-` for a link's empty branch.
+pub fn members_text(d: &MembersData) -> String {
+    if d.members.is_empty() {
+        return format!(
+            "{}/{} has no members (`members --add <name>` adds one)",
+            d.task.project, d.task.name
+        );
+    }
+    let rows: Vec<[&str; 4]> = std::iter::once(["MEMBER", "MODE", "BRANCH", "PATH"])
+        .chain(d.members.iter().map(|m| {
+            let branch = if m.branch.is_empty() { "-" } else { m.branch.as_str() };
+            [m.name.as_str(), m.mode.as_str(), branch, m.path.as_str()]
+        }))
+        .collect();
+    let width = |i: usize| rows.iter().map(|r| r[i].chars().count()).max().unwrap_or(0);
+    let (w0, w1, w2) = (width(0), width(1), width(2));
+    rows.iter()
+        .map(|r| format!("{:w0$}  {:w1$}  {:w2$}  {}", r[0], r[1], r[2], r[3]))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// One line saying how a watched run ended.
@@ -950,6 +972,31 @@ PROJECT  TASK              AGENT   STATE    DIFF          BRANCH
 web      fix-auth          claude  working  3f +10 -2 1u  fix-auth
 api      longer-task-name  codex   -        -             b2";
         assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn members_text_golden() {
+        let member = |name: &str, mode: &str, branch: &str, path: &str| termic_proto::MemberInfo {
+            name: name.into(),
+            dir_name: name.into(),
+            mode: mode.into(),
+            branch: branch.into(),
+            path: path.into(),
+        };
+        let mut d = MembersData {
+            task: summary(),
+            members: vec![
+                member("api", "worktree", "fix-auth", "/tasks/web/fix-auth/api"),
+                member("handbook", "repo_root", "", "/src/docs"),
+            ],
+        };
+        let expected = "\
+MEMBER    MODE       BRANCH    PATH
+api       worktree   fix-auth  /tasks/web/fix-auth/api
+handbook  repo_root  -         /src/docs";
+        assert_eq!(members_text(&d), expected);
+        d.members.clear();
+        assert_eq!(members_text(&d), "web/fix-auth has no members (`members --add <name>` adds one)");
     }
 
     fn shop() -> ProjectInfo {

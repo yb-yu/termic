@@ -173,6 +173,18 @@ whenever the work touches a member repo:
     "$TERMIC_CLI" new fix-login --project shop --member api --member web \
       -p "..."
 
+`members <task>` (MCP `task_members`) shows where a task's members
+live: its name, mode (its own worktree, or a link to the live
+checkout), branch and path. Read the paths from there rather than
+guessing them. On a live task, `--add <name>` and `--remove <name>`
+(each repeatable) change the members. Both converge, so a repeat does
+nothing. Removing a worktree member deletes its directory, so one with
+uncommitted changes is refused until you commit or stash them there,
+or pass `--yes` to discard them. Its branch and commits stay either
+way:
+
+    "$TERMIC_CLI" members fix-login --project shop --add docs
+
 ### Creating a task that produces a result
 
 Ask for a report back. End the prompt you give the new agent with the

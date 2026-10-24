@@ -268,6 +268,32 @@ changes: a worktree create is a single-repo `task_create` of the host
 with no members, and a main-checkout create (the only kind on a
 plain-folder host) links every member.
 
+`termic members` (proto v24, `Command::Members`, MCP `task_members`)
+reads a live task's composition and edits it through the Edit Task
+dialog's `task_update_members`. Without `add` / `remove` it is a pure
+read of the disk record (no RPC), and that list is the only place a
+caller learns each member's path, since the `new` reply carries none.
+`handle_members` resolves both name lists with `resolve_new_members`,
+refuses a non-multi task (bad_request), an unknown name (not_found) and
+a name in both lists, then converges: a member the composition already
+holds (matched by root, `composition_member`, the backend's
+`member_repo` rule plus the dialog's legacy dir-name fallback) is not
+re-added, and an absent one is not re-removed. When nothing is left it
+sends no RPC. Before any RPC, each WORKTREE member being removed gets
+`git status --porcelain` in its path, because teardown is
+`git worktree remove --force` plus an rm -rf: a non-empty status, or
+a dir git cannot read, refuses without `yes` (a missing dir is clean, a
+link is never checked). The `update_task_members` RPC carries
+`{ taskId, add: [root_path], remove: [dir_name] }` on the create budget
+(`NEW_TASK_TIMEOUT`); the webview builds `CreateMultiMember` specs as
+the dialog does (`repo_root` for a main checkout or a plain-folder
+member, else `worktree`) and reloads the store either way. The backend
+is per-member best-effort and saves what landed before it errors, so
+the server re-reads after the RPC: success replies with the fresh
+members, and an error is internal with the backend's message plus the
+members the task now has. Unlike the dialog, nothing toasts a failed
+setup script for an added member (same as `new --member`).
+
 `termic project list` (MCP `project_list`) is where a caller finds
 those names: `ProjectInfo` carries `type` ("single" or "multi", the
 `Project.type` key) and a multi project's `members`, each one's
