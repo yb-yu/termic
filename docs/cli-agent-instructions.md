@@ -173,6 +173,25 @@ whenever the work touches a member repo:
     "$TERMIC_CLI" new fix-login --project shop --member api --member web \
       -p "..."
 
+When no project holds the repos you need, make one with `project add
+--member <M>`, once per repo (MCP `project_add` `members`). `<M>` is
+tried, in order, as a registered project's name (its settings are
+copied), a directory path (`~`, or relative to your current directory),
+then a folder of that name in Settings' repos folder. Without a host
+path Termic creates a git host and `--name` is required; with one,
+`--name` defaults to the host folder's name and a plain-folder host
+needs `--non-git`. A name that is already taken is refused:
+
+    "$TERMIC_CLI" project add --name shop --member api --member ~/src/web
+
+`project members <project>` (MCP `project_members`) lists a project's
+members; `--add <M>` adds a repo the same way (one it already has is
+left alone), and `--remove <name>` takes one out (an unknown name
+fails, listing the members). This
+changes the project only: a task keeps the members it was created with.
+Over `--peer` the current directory means nothing, so name repos by
+project name or absolute path there.
+
 `members <task>` (MCP `task_members`) shows where a task's members
 live: its name, mode (its own worktree, or a link to the live
 checkout), branch and path. Read the paths from there rather than
@@ -413,7 +432,8 @@ means it could not be reached (nothing ran there).
 - `"$TERMIC_CLI" archive <task> --yes` - kill the task's agents and
   remove its worktree. Destructive; only when asked to clean up.
 - `"$TERMIC_CLI" project add <path>` - register a repo (needed once
-  before creating tasks in it).
+  before creating tasks in it). With `--member`, a multi-repo project
+  (see "Multi-repo projects" above).
 
 DO NOT run `"$TERMIC_CLI" quit`. Its `about` in `help --json` says the
 same, so this block and the machine surface agree. It exists for the

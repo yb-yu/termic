@@ -782,7 +782,7 @@ fn rpc_response(server: &McpServer, req: &HttpRequest) -> (u16, Vec<u8>) {
 /// (`agent_overview!` in termic-cli/src/lib.rs): keep the two in step. The
 /// point is the first sentence: an agent that does not realise it is running
 /// INSIDE a Termic task never thinks to start siblings or report back.
-const MCP_INSTRUCTIONS: &str = "Termic runs coding agents side by side, each in its own task (a git worktree, or the project's main checkout, with its own terminal), listed in the app's sidebar. If your environment has TERMIC_TASK_ID, you are one of those agents, running INSIDE a Termic task right now, and these tools drive the app around you. From there you can: launch new tasks with their own agents (task_new; in your project they join your task's group in the sidebar, in another they are linked to your task instead; you name the group for the batch of work with task_group); prompt another task's agent (task_send; it queues behind a busy agent's turn, and now=true skips that queue for a message that cannot wait) and read what it produced (task_log, task_result); open another agent tab in a task (task_tab); retitle your own task (task_rename); label your tab with what you are working on, shown on the task's sidebar row (task_prop, e.g. ticket=ABC-1; pass your TERMIC_TAB_ID as tab); and keep notes, plans, findings, logs and reports the user should READ in scratchpads (scratchpad_new, scratchpad_write): a tab in your task that updates live and stays out of git, so use one instead of dropping temporary .md files into the repo. A multi-repo project holds several repos, possibly many (project_list shows each project's type and members): task_new worktrees only the members you name in members (none without it), and task_members lists or changes a task's. Coordinate by prompting each other rather than blocking: end a prompt with how the other agent should report back to you (a task_send to your task id). Sign every prompt you send another agent, first line and last: [message from agent:<your agent> task:<your task name> id:<your TERMIC_TASK_ID>] ... -- agent:<your agent> task:<your task name> id:<your TERMIC_TASK_ID>, with the values written out (there is no shell here to fill them in; TERMIC_TASK holds your task name). A prompt that arrives WITH that header came from another agent, not the user: the id is where to reply. When Termic set this client up, it tells the server which task you run in, so task_rename, task_group, task_tab and task_prop default to your own task, exactly like the CLI; name other tasks explicitly. If this machine is paired with others on its network (peer_list), task_new, task_send, task_wait, task_result and task_list take peer:<machine> to run THERE, and peer_call runs any other tool there: put peer:<this machine's name> in your signature and ask for the reply as a task_send with peer:<this machine> back to your task id; a prompt whose header carries peer:<machine> came from that machine, so answer it, or ask it for help when stuck, with task_send peer:<machine> to the id in that header. Without TERMIC_TASK_ID you are driving Termic from outside it.";
+const MCP_INSTRUCTIONS: &str = "Termic runs coding agents side by side, each in its own task (a git worktree, or the project's main checkout, with its own terminal), listed in the app's sidebar. If your environment has TERMIC_TASK_ID, you are one of those agents, running INSIDE a Termic task right now, and these tools drive the app around you. From there you can: launch new tasks with their own agents (task_new; in your project they join your task's group in the sidebar, in another they are linked to your task instead; you name the group for the batch of work with task_group); prompt another task's agent (task_send; it queues behind a busy agent's turn, and now=true skips that queue for a message that cannot wait) and read what it produced (task_log, task_result); open another agent tab in a task (task_tab); retitle your own task (task_rename); label your tab with what you are working on, shown on the task's sidebar row (task_prop, e.g. ticket=ABC-1; pass your TERMIC_TAB_ID as tab); and keep notes, plans, findings, logs and reports the user should READ in scratchpads (scratchpad_new, scratchpad_write): a tab in your task that updates live and stays out of git, so use one instead of dropping temporary .md files into the repo. A multi-repo project holds several repos, possibly many (project_list shows each project's type and members): task_new worktrees only the members you name in members (none without it), and task_members lists or changes a task's; when no project holds the repos you need, project_add with members makes one, and project_members adds a repo to it later. Coordinate by prompting each other rather than blocking: end a prompt with how the other agent should report back to you (a task_send to your task id). Sign every prompt you send another agent, first line and last: [message from agent:<your agent> task:<your task name> id:<your TERMIC_TASK_ID>] ... -- agent:<your agent> task:<your task name> id:<your TERMIC_TASK_ID>, with the values written out (there is no shell here to fill them in; TERMIC_TASK holds your task name). A prompt that arrives WITH that header came from another agent, not the user: the id is where to reply. When Termic set this client up, it tells the server which task you run in, so task_rename, task_group, task_tab and task_prop default to your own task, exactly like the CLI; name other tasks explicitly. If this machine is paired with others on its network (peer_list), task_new, task_send, task_wait, task_result and task_list take peer:<machine> to run THERE, and peer_call runs any other tool there: put peer:<this machine's name> in your signature and ask for the reply as a task_send with peer:<this machine> back to your task id; a prompt whose header carries peer:<machine> came from that machine, so answer it, or ask it for help when stuck, with task_send peer:<machine> to the id in that header. Without TERMIC_TASK_ID you are driving Termic from outside it.";
 
 /// UnsupportedProtocolVersionError. The `supported` list has to be
 /// machine-readable in `data`: that is what a client retries from, and
@@ -1688,7 +1688,7 @@ const TOOLS: &[ToolDef] = &[
     ToolDef {
         name: "project_list",
         cli_verb: "project list",
-        description: "Registered projects with live-task counts.",
+        description: "Registered projects with live-task counts, each one's type, and a multi-repo project's member repos.",
         params: &[],
         destructive: false,
         read_only: true,
@@ -1697,16 +1697,39 @@ const TOOLS: &[ToolDef] = &[
     ToolDef {
         name: "project_add",
         cli_verb: "project add",
-        description: "Register a directory as a project (absolute path).",
+        description: "Register a directory as a project (absolute path), or with members a multi-repo project.",
         params: &[
-            ParamDef { name: "path", json_type: "string", required: true, description: "Absolute path to the repo (or folder with nonGit).", cli_flag: Some("path") },
-            ParamDef { name: "nonGit", json_type: "boolean", required: false, description: "Allow a plain non-git folder.", cli_flag: Some("--non-git") },
+            ParamDef { name: "path", json_type: "string", required: false, description: "Absolute path to the repo (or folder with nonGit). Required unless members is given; then the host folder, created when absent.", cli_flag: Some("path") },
+            ParamDef { name: "nonGit", json_type: "boolean", required: false, description: "Allow a plain non-git folder (with members, as the host).", cli_flag: Some("--non-git") },
+            ParamDef { name: "members", json_type: "array", required: false, description: "Makes it a multi-repo project: project names, absolute paths, or folders in Settings' repos folder.", cli_flag: Some("--member") },
+            ParamDef { name: "name", json_type: "string", required: false, description: "With members: the name, default the host folder's. Required without path.", cli_flag: Some("--name") },
         ],
         destructive: false,
         read_only: false,
-        build: |a| Ok(Command::ProjectAdd {
-            path: need_str(a, "path")?,
-            non_git: arg_bool(a, "nonGit")?,
+        build: |a| {
+            let (path, members) = (arg_str(a, "path")?, arg_str_list(a, "members")?);
+            if path.is_none() && members.is_empty() {
+                return Err("path is required unless members is given".into());
+            }
+            Ok(Command::ProjectAdd { path, non_git: arg_bool(a, "nonGit")?, members, name: arg_str(a, "name")?, cwd: None })
+        },
+    },
+    ToolDef {
+        name: "project_members",
+        cli_verb: "project members",
+        description: "List a multi-repo project's member repos, or add and remove them. Existing tasks keep theirs.",
+        params: &[
+            ParamDef { name: "project", json_type: "string", required: true, description: "Project name.", cli_flag: Some("project") },
+            ParamDef { name: "add", json_type: "array", required: false, description: "Repos to add, as project_add's members.", cli_flag: Some("--add") },
+            ParamDef { name: "remove", json_type: "array", required: false, description: "Member names to remove.", cli_flag: Some("--remove") },
+        ],
+        destructive: true,
+        read_only: false,
+        build: |a| Ok(Command::ProjectMembers {
+            project: need_str(a, "project")?,
+            add: arg_str_list(a, "add")?,
+            remove: arg_str_list(a, "remove")?,
+            cwd: None,
         }),
     },
     ToolDef {
@@ -4009,7 +4032,11 @@ mod tests {
         // where a multi-repo task's members live, and adding or removing
         // them on the live task. Short params; the dirty-worktree refusal
         // explains itself in the error.
-        const RECORDED: usize = 28779;
+        // 29788 (2026-10-25): project_add's `members` and `name`, parity
+        // with `termic project add --member`, and project_members, parity
+        // with `termic project members`: making a multi-repo project and
+        // changing its repos. The resolution order lives in the help.
+        const RECORDED: usize = 29788;
         assert!(
             size <= RECORDED,
             "serialized tools/list grew to {size} bytes (recorded {RECORDED}); grow it consciously"
@@ -4802,6 +4829,30 @@ command = \"/bin/true\"\n";
         assert!(add.is_empty() && remove.is_empty() && !yes);
         assert!(build("task_members", serde_json::json!({ "task": "feat", "remove": "api" })).is_err(), "an array, not one name");
         let t = TOOLS.iter().find(|t| t.name == "task_members").unwrap();
+        assert_eq!(tool_entry(t)["annotations"]["destructiveHint"], true);
+    }
+
+    #[test]
+    fn project_add_builds_a_multi_repo_add_from_members_and_still_needs_a_path_without() {
+        let c = build("project_add", serde_json::json!({ "members": ["api", "/src/web"], "name": "shop" })).unwrap();
+        let Command::ProjectAdd { path, non_git, members, name, cwd } = c else { panic!("{c:?}") };
+        assert_eq!((path, non_git, name.as_deref(), cwd), (None, false, Some("shop"), None));
+        assert_eq!(members, ["api", "/src/web"]);
+        // The single-repo call is the one it always was.
+        let Command::ProjectAdd { path, members, name, .. } = build("project_add", serde_json::json!({ "path": "/repo/web" })).unwrap() else { panic!() };
+        assert!(path.as_deref() == Some("/repo/web") && members.is_empty() && name.is_none());
+        assert!(build("project_add", serde_json::json!({})).is_err(), "nothing to register");
+        assert!(build("project_add", serde_json::json!({ "path": "/x", "members": "api" })).is_err(), "an array, not one name");
+    }
+
+    #[test]
+    fn project_members_builds_the_project_members_command() {
+        let c = build("project_members", serde_json::json!({ "project": "shop", "add": ["infra"], "remove": ["Web"] })).unwrap();
+        let Command::ProjectMembers { project, add, remove, cwd } = c else { panic!("{c:?}") };
+        assert_eq!((project.as_str(), add, remove, cwd), ("shop", vec!["infra".to_string()], vec!["Web".to_string()], None));
+        assert!(build("project_members", serde_json::json!({})).is_err(), "the project is required");
+        // It can drop members, so it is marked destructive.
+        let t = TOOLS.iter().find(|t| t.name == "project_members").unwrap();
         assert_eq!(tool_entry(t)["annotations"]["destructiveHint"], true);
     }
 

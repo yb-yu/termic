@@ -29,6 +29,8 @@ import { usePromptLibrary } from "@/store/prompts";
 import {
   onPtyData,
   projectAdd,
+  projectAddMulti,
+  projectSetMembers,
   ptyAlive,
   projectBranchContext,
   projectGitBranches,
@@ -72,7 +74,7 @@ import { slugify } from "@/lib/utils";
 import { checkoutTaskName, remoteNames } from "@/lib/existingBranch";
 import { padHandler } from "@/lib/scratchCli";
 import { scheduleHandler } from "@/lib/scheduleCli";
-import type { CreateMultiMember, SandboxMode, Task, TerminalTab } from "@/lib/types";
+import type { CreateMultiMember, ProjectMember, SandboxMode, Task, TerminalTab } from "@/lib/types";
 import {
   collectTaskProps, propKeyProblem, propValueProblem, PROP_KEYS_PER_TAB, type CollectedProp,
 } from "@/lib/tabProps";
@@ -813,6 +815,30 @@ async function projectAddHandler(params: unknown): Promise<{ projectId: string }
   return { projectId: project.id };
 }
 
+/** `termic project add --member` (v24): the New Project dialog's
+ *  multi-repo Add. The server already resolved the host path (empty: Rust
+ *  creates one), the name and every member. */
+async function projectAddMultiHandler(params: unknown): Promise<{ projectId: string }> {
+  const p = params as { path?: unknown; name?: unknown; members?: unknown; nonGit?: unknown };
+  if (typeof p?.name !== "string" || !p.name) throw new Error("project_add_multi requires a name");
+  if (!Array.isArray(p.members) || !p.members.length) throw new Error("project_add_multi requires members");
+  const path = typeof p.path === "string" ? p.path : "";
+  const project = await projectAddMulti(path, p.name, p.members as ProjectMember[], p.nonGit === true);
+  await useApp.getState().loadAll();
+  return { projectId: project.id };
+}
+
+/** `termic project members --add/--remove` (v24): the Repository settings
+ *  page's member save, with the FULL new list the server built. */
+async function projectSetMembersHandler(params: unknown): Promise<null> {
+  const p = params as { projectId?: unknown; members?: unknown };
+  if (typeof p?.projectId !== "string" || !p.projectId) throw new Error("project_set_members requires a projectId");
+  if (!Array.isArray(p.members)) throw new Error("project_set_members requires members");
+  await projectSetMembers(p.projectId, p.members as ProjectMember[]);
+  await useApp.getState().loadAll();
+  return null;
+}
+
 async function projectRemoveHandler(params: unknown): Promise<null> {
   const projectId = (params as { projectId?: unknown })?.projectId;
   if (typeof projectId !== "string" || !projectId) throw new Error("project_remove requires a projectId");
@@ -1508,6 +1534,8 @@ const handlers: Record<string, Handler> = {
   pad: padHandler,
   schedule: scheduleHandler,
   project_add: projectAddHandler,
+  project_add_multi: projectAddMultiHandler,
+  project_set_members: projectSetMembersHandler,
   project_remove: projectRemoveHandler,
 };
 

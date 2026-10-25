@@ -661,6 +661,9 @@ pub(crate) trait CliHost: Send + Sync {
     fn stop_tab_ptys(&self, task_id: &str, tab_id: &str) -> u32;
     /// The user's home directory (session transcripts live under it).
     fn home_dir(&self) -> Option<PathBuf>;
+    /// Settings' `repos_dir` in the profile a project RPC lands in: that
+    /// project's, or with none the window a new project would join.
+    fn repos_dir(&self, project_id: Option<&str>) -> String;
     /// This app's LAN pairing node (docs/peers.md): the `peer` verbs and
     /// `--peer` forwarding go through it. None in test hosts that do not
     /// exercise pairing, and in an app with no data dir.
@@ -955,11 +958,22 @@ pub(crate) fn dispatch_authenticated(
             &req.id, host, task.as_deref(), project.as_deref(), scope.as_deref(), cwd.as_deref(),
             serde_json::json!({ "op": "clear" }),
         ),
-        Command::ProjectAdd { path, non_git } => {
-            handle_project_add(&req.id, host, path, *non_git)
+        // `members` is what makes it a multi-repo project (v24).
+        Command::ProjectAdd { path, non_git, members, name, cwd } if !members.is_empty() => handle_project_add_multi(
+            &req.id, host, name.as_deref(), members, path.as_deref(), *non_git, cwd.as_deref(),
+        ),
+        Command::ProjectAdd { name: Some(_), .. } => {
+            Reply::err(&req.id, ErrorCode::BadRequest, "--name names a multi-repo project; pass it with --member")
+        }
+        Command::ProjectAdd { path: Some(path), non_git, .. } => handle_project_add(&req.id, host, path, *non_git),
+        Command::ProjectAdd { path: None, .. } => {
+            Reply::err(&req.id, ErrorCode::BadRequest, "project add needs a path (or --member for a multi-repo project)")
         }
         Command::ProjectList => handle_project_list(&req.id, host),
         Command::ProjectRemove { name } => handle_project_remove(&req.id, host, name),
+        Command::ProjectMembers { project, add, remove, cwd } => {
+            handle_project_members(&req.id, host, project, add, remove, cwd.as_deref())
+        }
         Command::ScheduleList { project } => handle_schedule(
             &req.id, host, None, project.as_deref(), None,
             serde_json::json!({ "op": "list" }),
@@ -4071,6 +4085,252 @@ fn handle_project_remove(id: &str, host: &dyn CliHost, name: &str) -> Reply {
     )
 }
 
+/// A path argument as the caller meant it: `~` expanded, a relative one
+/// joined to the CALLER's cwd (never this process's). None for a relative
+/// path with no cwd to anchor it: MCP sends none, and `--peer` strips it.
+fn caller_path(raw: &str, cwd: Option<&str>) -> Option<PathBuf> {
+    let p = PathBuf::from(crate::expand_tilde(raw));
+    if p.is_absolute() {
+        Some(p)
+    } else {
+        cwd.map(|c| Path::new(c).join(p))
+    }
+}
+
+/// One member spec of `project add --member` / `project members --add`
+/// (v24), as the self-contained member it adds. Tried in order: a
+/// registered single-repo project (its fields copied, as the New Project
+/// dialog's `addMemberFromProject` does), a directory at that path, then a
+/// bare name under Settings' repos dir. A disk member carries only its
+/// path, like `addMemberFromDisk`: `normalize_member` fills its name, git
+/// status and base when the backend saves it.
+fn resolve_member_spec(
+    spec: &str,
+    projects: &[Project],
+    cwd: Option<&str>,
+    repos_dir: &str,
+) -> Result<crate::ProjectMember, proto::ErrorBody> {
+    let err = |code, message: String| proto::ErrorBody { code, message, data: None };
+    let spec = spec.trim();
+    if spec.is_empty() {
+        return Err(err(ErrorCode::BadRequest, "a member needs a project name or a path".into()));
+    }
+    if let Some(p) = find_project(projects, spec) {
+        if p.project_type == crate::ProjectType::Multi {
+            return Err(err(
+                ErrorCode::BadRequest,
+                format!("\"{}\" is a multi-repo project; a member is one repo or folder", p.name),
+            ));
+        }
+        return Ok(crate::ProjectMember {
+            // Canonical, as normalize_member stores it, so dedup compares like with like.
+            root_path: crate::canon_str(&p.root_path),
+            name: p.name.clone(),
+            non_git: p.non_git,
+            base_branch: p.base_branch.clone(),
+            setup_script: p.setup_script.clone(),
+            run_script: p.run_script.clone(),
+            archive_script: p.archive_script.clone(),
+            sandbox_rw_paths: p.sandbox_rw_paths.clone(),
+            sandbox_allowed_hosts: p.sandbox_allowed_hosts.clone(),
+            ..Default::default()
+        });
+    }
+    let bare = !spec.contains(['/', '\\']);
+    let repos_dir = repos_dir.trim();
+    let under_repos = (bare && !repos_dir.is_empty()).then(|| PathBuf::from(crate::expand_tilde(repos_dir)).join(spec));
+    let mut tried = Vec::new();
+    for dir in [caller_path(spec, cwd), under_repos].into_iter().flatten() {
+        if dir.is_dir() {
+            return Ok(crate::ProjectMember {
+                root_path: crate::canon_str(&dir.to_string_lossy()),
+                ..Default::default()
+            });
+        }
+        tried.push(dir.to_string_lossy().into_owned());
+    }
+    let singles: Vec<&str> = projects
+        .iter()
+        .filter(|p| p.project_type != crate::ProjectType::Multi)
+        .map(|p| p.name.as_str())
+        .collect();
+    let tried = if tried.is_empty() { String::new() } else { format!(" (no directory at {})", tried.join(" or ")) };
+    let singles = if singles.is_empty() { "none".to_string() } else { singles.join(", ") };
+    Err(err(
+        ErrorCode::NotFound,
+        format!("\"{spec}\" is neither a project nor a folder{tried}; single-repo projects: {singles}"),
+    ))
+}
+
+/// Resolve each spec and append its member to `list` unless a member with
+/// that root is already there, so a repeat, or a repo named once by project
+/// and once by path, adds it once. The host can never be its own member.
+fn append_member_specs(
+    list: &mut Vec<crate::ProjectMember>,
+    specs: &[String],
+    host_root: Option<&str>,
+    projects: &[Project],
+    cwd: Option<&str>,
+    repos_dir: &str,
+) -> Result<(), proto::ErrorBody> {
+    for spec in specs {
+        let m = resolve_member_spec(spec, projects, cwd, repos_dir)?;
+        if host_root.is_some_and(|h| crate::canon_str(h) == m.root_path) {
+            return Err(proto::ErrorBody {
+                code: ErrorCode::BadRequest,
+                message: format!("{} is the project's host; a multi-repo project can't list its own host as a member", m.root_path),
+                data: None,
+            });
+        }
+        if !list.iter().any(|x| x.root_path == m.root_path) {
+            list.push(m);
+        }
+    }
+    Ok(())
+}
+
+/// `project add --member` (v24): the New Project dialog's multi-repo Add.
+/// The name, the members and the host are settled here against the disk
+/// read, so the webview's `project_add_multi` RPC only creates.
+fn handle_project_add_multi(
+    id: &str,
+    host: &dyn CliHost,
+    name: Option<&str>,
+    specs: &[String],
+    host_path: Option<&str>,
+    non_git: bool,
+    cwd: Option<&str>,
+) -> Reply {
+    if non_git && host_path.is_none() {
+        return Reply::err(id, ErrorCode::BadRequest, "--non-git describes the host path; without one Termic creates a git host");
+    }
+    // Empty asks the backend to create the host (~/<app dir>/projects/<slug>).
+    let host_dir = match host_path {
+        None => String::new(),
+        Some(h) => match caller_path(h, cwd) {
+            Some(p) => crate::canon_str(&p.to_string_lossy()),
+            None => return Reply::err(id, ErrorCode::BadRequest, format!("host path {h} is relative; pass an absolute path")),
+        },
+    };
+    // The dialog has no default (its name field starts empty); with a host
+    // folder its name is the obvious one, as `project add` names a repo.
+    let default_name = Path::new(&host_dir).file_name().map(|n| n.to_string_lossy().into_owned());
+    let Some(name) = name.map(str::trim).filter(|n| !n.is_empty()).map(str::to_string).or(default_name) else {
+        return Reply::err(id, ErrorCode::BadRequest, "name the project with --name: Termic creates its host folder from it");
+    };
+    if crate::slugify(&name).is_empty() {
+        return Reply::err(id, ErrorCode::BadRequest, "the project name must contain at least one letter or number");
+    }
+    let (projects, _) = host.projects_tasks();
+    // A same-name project is refused, never merged into: two rows with one
+    // name would make every by-name verb ambiguous.
+    if let Some(p) = projects.iter().find(|p| p.name.eq_ignore_ascii_case(&name)) {
+        let hint = if p.project_type == crate::ProjectType::Multi {
+            format!("; `project members {} --add <M>` adds members to it", p.name)
+        } else {
+            "; pick another name with --name".into()
+        };
+        return Reply::err(id, ErrorCode::Conflict, format!("a project named \"{}\" already exists{hint}", p.name));
+    }
+    // Typically a repos folder already registered as a plain-folder project;
+    // the backend refuses it too, as an error that reads like an internal one.
+    if let Some(p) = projects.iter().find(|p| !host_dir.is_empty() && crate::canon_str(&p.root_path) == host_dir) {
+        return Reply::err(
+            id,
+            ErrorCode::Conflict,
+            format!(
+                "{host_dir} is already the project \"{}\"; leave the host path out and Termic creates a host for the multi-repo project",
+                p.name
+            ),
+        );
+    }
+    let mut members = Vec::new();
+    let repos_dir = host.repos_dir(None);
+    let host_root = (!host_dir.is_empty()).then_some(host_dir.as_str());
+    if let Err(e) = append_member_specs(&mut members, specs, host_root, &projects, cwd, &repos_dir) {
+        return Reply { id: id.to_string(), ok: false, data: None, error: Some(e) };
+    }
+    let value = match host.rpc(
+        "project_add_multi",
+        serde_json::json!({ "path": host_dir, "name": name, "members": members, "nonGit": non_git }),
+        PROJECT_RPC_TIMEOUT,
+    ) {
+        Ok(v) => v,
+        // As a single `project add`: the backend's message describes the
+        // GUI's plain-folder confirmation, which is a flag here.
+        Err(e) if !non_git && e.contains("not a git repo") => {
+            return Reply::err(
+                id,
+                ErrorCode::BadRequest,
+                format!("{host_dir} is not a git repository. Pass --non-git to use a plain folder as the host."),
+            );
+        }
+        Err(e) => return Reply::err(id, ErrorCode::Internal, format!("could not create the project ({e})")),
+    };
+    let project_id = value.get("projectId").and_then(|v| v.as_str()).unwrap_or_default();
+    let (projects, tasks) = host.projects_tasks();
+    let Some(p) = projects.iter().find(|p| p.id == project_id) else {
+        return Reply::err(id, ErrorCode::Internal, "the project was created but could not be read back");
+    };
+    Reply::ok(id, ReplyData::ProjectAdd(proto::ProjectAddData { project: project_info(p, &tasks) }))
+}
+
+/// `project members` (v24): list a multi-repo project's members, or send
+/// the webview's `project_set_members` RPC the FULL new list (the
+/// Repository settings page's save): the members kept, in order, then the
+/// ones added. Tasks are untouched; each froze its composition at create.
+fn handle_project_members(
+    id: &str,
+    host: &dyn CliHost,
+    project: &str,
+    add: &[String],
+    remove: &[String],
+    cwd: Option<&str>,
+) -> Reply {
+    let (projects, tasks) = host.projects_tasks();
+    let Some(proj) = find_project(&projects, project) else {
+        return Reply::err(id, ErrorCode::NotFound, format!("no project named \"{project}\""));
+    };
+    if proj.project_type != crate::ProjectType::Multi {
+        return Reply::err(
+            id,
+            ErrorCode::BadRequest,
+            format!("project \"{}\" is not a multi-repo project; only multi-repo projects have members", proj.name),
+        );
+    }
+    // An unknown name is refused, not skipped: removing a typo would read
+    // as success while the member stays.
+    let removed = match resolve_new_members(proj, remove) {
+        Ok(roots) => roots,
+        Err(e) => return Reply { id: id.to_string(), ok: false, data: None, error: Some(e) },
+    };
+    let mut list: Vec<crate::ProjectMember> =
+        proj.members.iter().filter(|m| !removed.contains(&m.root_path)).cloned().collect();
+    let kept = list.len();
+    let repos_dir = host.repos_dir(Some(&proj.id));
+    if let Err(e) = append_member_specs(&mut list, add, Some(&proj.root_path), &projects, cwd, &repos_dir) {
+        return Reply { id: id.to_string(), ok: false, data: None, error: Some(e) };
+    }
+    if let Some(m) = list[kept..].iter().find(|m| removed.contains(&m.root_path)) {
+        return Reply::err(id, ErrorCode::BadRequest, format!("{} is both added and removed; pass it once", m.root_path));
+    }
+    if kept == proj.members.len() && list.len() == kept {
+        return Reply::ok(id, ReplyData::ProjectMembers(proto::ProjectMembersData { project: project_info(proj, &tasks) }));
+    }
+    if let Err(e) = host.rpc(
+        "project_set_members",
+        serde_json::json!({ "projectId": proj.id, "members": list }),
+        PROJECT_RPC_TIMEOUT,
+    ) {
+        return Reply::err(id, ErrorCode::Internal, format!("could not update the members ({e})"));
+    }
+    let (projects, tasks) = host.projects_tasks();
+    let Some(p) = projects.iter().find(|p| p.id == proj.id) else {
+        return Reply::err(id, ErrorCode::Internal, "the project disappeared while updating its members");
+    };
+    Reply::ok(id, ReplyData::ProjectMembers(proto::ProjectMembersData { project: project_info(p, &tasks) }))
+}
+
 fn summarize(
     task: &Task,
     projects: &[Project],
@@ -4637,6 +4897,11 @@ impl CliHost for TauriHost {
     }
     fn home_dir(&self) -> Option<PathBuf> {
         dirs::home_dir()
+    }
+    fn repos_dir(&self, project_id: Option<&str>) -> String {
+        // The window the RPC will reach is the profile whose settings apply.
+        let label = rpc_target_label(&self.app, &serde_json::json!({ "projectId": project_id }));
+        crate::load_settings_in(&crate::ProfileId::from_window_label(&label).unwrap_or_default()).repos_dir
     }
     fn peers(&self) -> Option<Arc<crate::peers::Node>> {
         crate::peers::node()
@@ -6401,6 +6666,12 @@ pub(crate) mod test_support {
         pub(crate) resizes: Mutex<Vec<(String, u16, u16)>>,
         /// Fake home dir for the transcript reader.
         pub(crate) home: Option<PathBuf>,
+        /// Settings' `repos_dir` (member specs resolve bare names under it).
+        pub(crate) repos_dir: String,
+        /// Projects a scripted `project_add_multi` / `project_set_members`
+        /// rpc saved, overlaid on `projects` by id, so the reload after it
+        /// sees what the backend would have written.
+        pub(crate) saved_projects: Mutex<Vec<Project>>,
     }
 
     impl Default for StubHost {
@@ -6449,6 +6720,8 @@ pub(crate) mod test_support {
                 taps: Mutex::new(HashMap::new()),
                 resizes: Mutex::new(Vec::new()),
                 home: None,
+                repos_dir: String::new(),
+                saved_projects: Mutex::new(Vec::new()),
             }
         }
     }
@@ -6494,7 +6767,14 @@ pub(crate) mod test_support {
                     t.composition = c.clone();
                 }
             }
-            (self.projects.clone(), tasks)
+            let mut projects = self.projects.clone();
+            for p in self.saved_projects.lock().unwrap().iter() {
+                match projects.iter_mut().find(|x| x.id == p.id) {
+                    Some(x) => *x = p.clone(),
+                    None => projects.push(p.clone()),
+                }
+            }
+            (projects, tasks)
         }
         fn work_states(&self, _ids: &[String]) -> Option<HashMap<String, WorkStateInfo>> {
             self.states.as_ref().map(|m| {
@@ -6547,6 +6827,20 @@ pub(crate) mod test_support {
                         self.renames.lock().unwrap().insert(tid.into(), name.into());
                     }
                 }
+            }
+            if let (Ok(v), "project_add_multi" | "project_set_members") = (&result, method) {
+                // The member list as sent (the stub runs no normalize_member).
+                let pid = v.get("projectId").or(params.get("projectId")).and_then(|x| x.as_str()).unwrap_or_default();
+                let mut p = self.projects_tasks().0.into_iter().find(|p| p.id == pid).unwrap_or_else(|| {
+                    let mut p = project(pid, params["name"].as_str().unwrap_or_default(), params["path"].as_str().unwrap_or_default());
+                    p.project_type = crate::ProjectType::Multi;
+                    p.non_git = params["nonGit"] == true;
+                    p
+                });
+                p.members = serde_json::from_value(params["members"].clone()).unwrap_or_default();
+                let mut saved = self.saved_projects.lock().unwrap();
+                saved.retain(|x| x.id != pid);
+                saved.push(p);
             }
             if method == "update_task_members" {
                 if let (Some(tid), Some(c)) =
@@ -6684,6 +6978,9 @@ pub(crate) mod test_support {
         }
         fn home_dir(&self) -> Option<PathBuf> {
             self.home.clone()
+        }
+        fn repos_dir(&self, _project_id: Option<&str>) -> String {
+            self.repos_dir.clone()
         }
     }
 
@@ -8950,7 +9247,7 @@ mod tests {
         let host = StubHost::default();
         host.script_rpc("project_add", Ok(serde_json::json!({ "projectId": "p2" })));
         let reply = handle(
-            &req(Command::ProjectAdd { path: "/repo/api".into(), non_git: false }, Some("tok")),
+            &req(Command::ProjectAdd { path: Some("/repo/api".into()), non_git: false, members: Vec::new(), name: None, cwd: None }, Some("tok")),
             &host,
         );
         let Some(ReplyData::ProjectAdd(a)) = reply.data else { panic!("expected add, got {reply:?}") };
@@ -8967,7 +9264,7 @@ mod tests {
         let host = StubHost::default();
         host.script_rpc("project_add", Err("project already added".into()));
         let reply = handle(
-            &req(Command::ProjectAdd { path: "/repo/api".into(), non_git: false }, Some("tok")),
+            &req(Command::ProjectAdd { path: Some("/repo/api".into()), non_git: false, members: Vec::new(), name: None, cwd: None }, Some("tok")),
             &host,
         );
         let Some(ReplyData::ProjectAdd(a)) = reply.data else { panic!("expected add, got {reply:?}") };
@@ -8976,7 +9273,7 @@ mod tests {
         let host = StubHost::default();
         host.script_rpc("project_add", Err("project already added".into()));
         let reply = handle(
-            &req(Command::ProjectAdd { path: "/repo/unknown".into(), non_git: false }, Some("tok")),
+            &req(Command::ProjectAdd { path: Some("/repo/unknown".into()), non_git: false, members: Vec::new(), name: None, cwd: None }, Some("tok")),
             &host,
         );
         assert_eq!(reply.error.expect("error").code, ErrorCode::Internal);
@@ -9058,7 +9355,7 @@ mod tests {
             Err("/x/plain is not a git repo. Confirm adding it as a plain folder.".into()),
         );
         let reply = handle(
-            &req(Command::ProjectAdd { path: "/x/plain".into(), non_git: false }, Some("tok")),
+            &req(Command::ProjectAdd { path: Some("/x/plain".into()), non_git: false, members: Vec::new(), name: None, cwd: None }, Some("tok")),
             &host,
         );
         let err = reply.error.expect("error");
@@ -9068,7 +9365,7 @@ mod tests {
         let host = StubHost::default();
         host.script_rpc("project_add", Ok(serde_json::json!({ "projectId": "p2" })));
         let reply = handle(
-            &req(Command::ProjectAdd { path: "/x/plain".into(), non_git: true }, Some("tok")),
+            &req(Command::ProjectAdd { path: Some("/x/plain".into()), non_git: true, members: Vec::new(), name: None, cwd: None }, Some("tok")),
             &host,
         );
         assert!(reply.ok, "{reply:?}");
@@ -9102,7 +9399,70 @@ mod tests {
         assert!(host.ops.lock().unwrap().is_empty());
     }
 
-    // ── project list: each project's type and members (v24) ──────────
+    // ── project add --member / project members (v24) ─────────────────
+
+    fn add_cmd(path: Option<&str>, members: &[&str], name: Option<&str>, non_git: bool, cwd: Option<&Path>) -> Command {
+        Command::ProjectAdd {
+            path: path.map(str::to_string),
+            non_git,
+            members: members.iter().map(|m| m.to_string()).collect(),
+            name: name.map(str::to_string),
+            cwd: cwd.map(|c| c.to_string_lossy().into_owned()),
+        }
+    }
+
+    fn project_members_cmd(project: &str, add: &[&str], remove: &[&str], cwd: Option<&Path>) -> Command {
+        Command::ProjectMembers {
+            project: project.into(),
+            add: add.iter().map(|m| m.to_string()).collect(),
+            remove: remove.iter().map(|m| m.to_string()).collect(),
+            cwd: cwd.map(|c| c.to_string_lossy().into_owned()),
+        }
+    }
+
+    /// A real directory tree for the path steps: `host`, `alpha`, `beta`
+    /// and `gamma` under one tempdir.
+    fn bundle_dirs() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        for d in ["host", "alpha", "beta", "gamma"] {
+            std::fs::create_dir(tmp.path().join(d)).unwrap();
+        }
+        tmp
+    }
+
+    fn canon(p: &Path) -> String {
+        crate::canon_str(&p.to_string_lossy())
+    }
+
+    /// The stub plus multi-repo project "bundle" hosted at `tmp/host` with
+    /// members alpha and beta.
+    fn bundle_host(tmp: &Path) -> StubHost {
+        let mut host = StubHost::default();
+        let mut bundle = project("p9", "bundle", &canon(&tmp.join("host")));
+        bundle.project_type = crate::ProjectType::Multi;
+        bundle.members = ["alpha", "beta"]
+            .map(|n| crate::ProjectMember { name: n.into(), root_path: canon(&tmp.join(n)), ..Default::default() })
+            .to_vec();
+        host.projects.push(bundle);
+        host.script_rpc("project_set_members", Ok(serde_json::Value::Null));
+        host.script_rpc("project_add_multi", Ok(serde_json::json!({ "projectId": "p10" })));
+        host
+    }
+
+    fn rpc_err(host: &StubHost, cmd: Command) -> proto::ErrorBody {
+        handle(&req(cmd, Some("tok")), host).error.expect("expected a refusal")
+    }
+
+    /// The (method, params) of the one rpc sent.
+    fn only_rpc(host: &StubHost) -> (String, serde_json::Value) {
+        let calls = host.rpc_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        calls[0].clone()
+    }
+
+    fn roots(params: &serde_json::Value) -> Vec<String> {
+        params["members"].as_array().unwrap().iter().map(|m| m["root_path"].as_str().unwrap().to_string()).collect()
+    }
 
     #[test]
     fn project_list_reports_each_projects_type_and_a_multi_projects_members() {
@@ -9114,6 +9474,273 @@ mod tests {
         assert_eq!(rows, [("api", "/src/api", false), ("Web", "/src/web", false), ("docs", "/src/docs", true)]);
         let web = l.projects.iter().find(|p| p.name == "web").unwrap();
         assert_eq!((web.project_type.as_str(), web.members.len()), ("single", 0));
+    }
+
+    #[test]
+    fn a_member_spec_naming_a_project_copies_its_fields_ahead_of_a_same_named_folder() {
+        let tmp = bundle_dirs();
+        std::fs::create_dir(tmp.path().join("web")).unwrap();
+        let mut host = bundle_host(tmp.path());
+        let web = host.projects.iter_mut().find(|p| p.name == "web").unwrap();
+        web.base_branch = "origin/dev".into();
+        web.setup_script = "npm ci".into();
+        web.run_script = "npm start".into();
+        web.archive_script = "rm -rf dist".into();
+        web.sandbox_rw_paths = vec!["/var/cache".into()];
+        web.sandbox_allowed_hosts = vec!["git.acme.com".into()];
+        // `WEB` from a cwd holding a `web` folder: the project wins.
+        handle(&req(add_cmd(None, &["WEB"], Some("shop"), false, Some(tmp.path())), Some("tok")), &host);
+        let (method, params) = only_rpc(&host);
+        assert_eq!(method, "project_add_multi");
+        let m = &params["members"][0];
+        assert_eq!(m["root_path"], "/repo/web");
+        assert_eq!(m["name"], "web");
+        assert_eq!(m["base_branch"], "origin/dev");
+        assert_eq!((m["setup_script"].as_str(), m["run_script"].as_str(), m["archive_script"].as_str()), (Some("npm ci"), Some("npm start"), Some("rm -rf dist")));
+        assert_eq!(m["sandbox_rw_paths"], serde_json::json!(["/var/cache"]));
+        assert_eq!(m["sandbox_allowed_hosts"], serde_json::json!(["git.acme.com"]));
+    }
+
+    #[test]
+    fn a_member_spec_path_resolves_against_the_callers_cwd_and_carries_only_its_path() {
+        let tmp = bundle_dirs();
+        let host = bundle_host(tmp.path());
+        let (alpha, beta) = (tmp.path().join("alpha"), tmp.path().join("beta"));
+        // From inside beta: a dotted and an absolute spelling of alpha are one
+        // member, and `.` is beta itself.
+        let specs = ["../alpha", alpha.to_str().unwrap(), "."];
+        handle(&req(add_cmd(None, &specs, Some("shop"), false, Some(&beta)), Some("tok")), &host);
+        let (_, params) = only_rpc(&host);
+        assert_eq!(roots(&params), [canon(&alpha), canon(&beta)]);
+        // Name, git status and base are normalize_member's to fill on save.
+        let m = &params["members"][0];
+        assert_eq!((m["name"].as_str(), m["base_branch"].as_str(), m["non_git"].as_bool()), (Some(""), Some(""), Some(false)));
+    }
+
+    #[test]
+    fn a_relative_member_spec_without_a_cwd_never_resolves_against_the_servers() {
+        let tmp = bundle_dirs();
+        let host = bundle_host(tmp.path());
+        // MCP and `--peer` carry no cwd: a relative path is only a name then.
+        let err = rpc_err(&host, add_cmd(None, &["src"], Some("shop"), false, None));
+        assert_eq!(err.code, ErrorCode::NotFound);
+        assert!(host.rpc_calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_bare_member_name_falls_back_to_the_repos_dir() {
+        let tmp = bundle_dirs();
+        let mut host = bundle_host(tmp.path());
+        host.repos_dir = tmp.path().to_string_lossy().into_owned();
+        // The cwd has no gamma; the repos dir does.
+        let elsewhere = tempfile::tempdir().unwrap();
+        handle(&req(add_cmd(None, &["gamma"], Some("shop"), false, Some(elsewhere.path())), Some("tok")), &host);
+        assert_eq!(roots(&only_rpc(&host).1), [canon(&tmp.path().join("gamma"))]);
+        // A spec with a separator is a path, never looked up there.
+        let err = rpc_err(&host, add_cmd(None, &["x/gamma"], Some("shop2"), false, Some(elsewhere.path())));
+        assert_eq!(err.code, ErrorCode::NotFound);
+    }
+
+    #[test]
+    fn an_unknown_member_spec_names_what_was_tried_and_the_single_repo_projects() {
+        let tmp = bundle_dirs();
+        let mut host = bundle_host(tmp.path());
+        host.repos_dir = "/nonexistent/repos".into();
+        let err = rpc_err(&host, add_cmd(None, &["alpha", "delta"], Some("shop"), false, Some(tmp.path())));
+        assert_eq!(err.code, ErrorCode::NotFound);
+        let msg = &err.message;
+        assert!(msg.starts_with("\"delta\" is neither a project nor a folder"), "{msg}");
+        assert!(msg.contains(&tmp.path().join("delta").to_string_lossy().into_owned()), "{msg}");
+        assert!(msg.contains("/nonexistent/repos/delta"), "{msg}");
+        assert!(msg.ends_with("single-repo projects: web, api"), "the multi project is not offered: {msg}");
+        assert!(host.rpc_calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_multi_repo_project_is_refused_as_a_member() {
+        let tmp = bundle_dirs();
+        let host = bundle_host(tmp.path());
+        let err = rpc_err(&host, add_cmd(None, &["Bundle"], Some("shop"), false, None));
+        assert_eq!(err.code, ErrorCode::BadRequest);
+        assert!(err.message.contains("\"bundle\" is a multi-repo project"), "{}", err.message);
+        assert!(host.rpc_calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn add_multi_creates_through_the_webview_and_replies_with_the_saved_project() {
+        let tmp = bundle_dirs();
+        let host = bundle_host(tmp.path());
+        let reply = handle(&req(add_cmd(None, &["web", "api", "Web"], Some(" shop "), false, None), Some("tok")), &host);
+        let (method, params) = only_rpc(&host);
+        assert_eq!(method, "project_add_multi");
+        // No --host: empty, so the backend creates and seeds one.
+        assert_eq!((params["path"].as_str(), params["name"].as_str(), params["nonGit"].as_bool()), (Some(""), Some("shop"), Some(false)));
+        assert_eq!(roots(&params), ["/repo/web", "/repo/api"], "a repeat is one member");
+        let Some(ReplyData::ProjectAdd(a)) = reply.data else { panic!("{:?}", reply.error) };
+        assert_eq!((a.project.id.as_str(), a.project.project_type.as_str()), ("p10", "multi"));
+        let names: Vec<_> = a.project.members.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(names, ["web", "api"]);
+    }
+
+    #[test]
+    fn add_multi_with_a_plain_folder_host_needs_non_git() {
+        let tmp = bundle_dirs();
+        let host = bundle_host(tmp.path());
+        let plain = tmp.path().join("gamma");
+        host.script_rpc("project_add_multi", Err(format!("{} is not a git repo. Confirm using it as a plain folder host.", plain.display())));
+        // Relative to the caller's cwd, like a member.
+        let err = rpc_err(&host, add_cmd(Some("gamma"), &["alpha"], Some("shop"), false, Some(tmp.path())));
+        assert_eq!(err.code, ErrorCode::BadRequest);
+        assert!(err.message.contains("Pass --non-git to use a plain folder as the host"), "{}", err.message);
+        assert_eq!(only_rpc(&host).1["path"], canon(&plain));
+
+        let host = bundle_host(tmp.path());
+        let reply = handle(&req(add_cmd(Some("gamma"), &["alpha"], Some("shop"), true, Some(tmp.path())), Some("tok")), &host);
+        assert!(reply.ok, "{reply:?}");
+        let (_, params) = only_rpc(&host);
+        assert_eq!((params["path"].as_str(), params["nonGit"].as_bool()), (Some(canon(&plain).as_str()), Some(true)));
+    }
+
+    #[test]
+    fn add_multi_refuses_a_host_that_is_already_a_project() {
+        let tmp = bundle_dirs();
+        let host = bundle_host(tmp.path());
+        let err = rpc_err(&host, add_cmd(Some("/repo/web"), &["api"], Some("shop"), false, None));
+        assert_eq!(err.code, ErrorCode::Conflict);
+        assert!(err.message.contains("is already the project \"web\""), "{}", err.message);
+        assert!(err.message.contains("leave the host path out"), "{}", err.message);
+        assert!(host.rpc_calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn add_with_members_names_the_project_after_its_host_unless_told_otherwise() {
+        let tmp = bundle_dirs();
+        let host = bundle_host(tmp.path());
+        handle(&req(add_cmd(Some("gamma"), &["alpha"], None, true, Some(tmp.path())), Some("tok")), &host);
+        assert_eq!(only_rpc(&host).1["name"], "gamma");
+        let host = bundle_host(tmp.path());
+        handle(&req(add_cmd(Some("gamma"), &["alpha"], Some("Shop"), true, Some(tmp.path())), Some("tok")), &host);
+        assert_eq!(only_rpc(&host).1["name"], "Shop");
+        // The default is a name like any other: a taken one is refused.
+        std::fs::create_dir(tmp.path().join("web")).unwrap();
+        let host = bundle_host(tmp.path());
+        let err = rpc_err(&host, add_cmd(Some("web"), &["alpha"], None, true, Some(tmp.path())));
+        assert_eq!(err.code, ErrorCode::Conflict);
+        assert!(err.message.contains("pick another name with --name"), "{}", err.message);
+        assert!(host.rpc_calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn project_add_without_members_is_the_single_repo_add_it_always_was() {
+        let host = StubHost::default();
+        // `name` belongs to a multi-repo add; a bare add needs its path.
+        let err = rpc_err(&host, add_cmd(Some("/repo/api"), &[], Some("api2"), false, None));
+        assert_eq!(err.code, ErrorCode::BadRequest);
+        assert!(err.message.contains("--member"), "{}", err.message);
+        let err = rpc_err(&host, add_cmd(None, &[], None, false, None));
+        assert_eq!(err.code, ErrorCode::BadRequest);
+        assert!(host.rpc_calls.lock().unwrap().is_empty());
+        // Otherwise the pre-v24 call, to the pre-v24 RPC.
+        host.script_rpc("project_add", Ok(serde_json::json!({ "projectId": "p2" })));
+        let reply = handle(&req(add_cmd(Some("/repo/api"), &[], None, false, Some(Path::new("/elsewhere"))), Some("tok")), &host);
+        let Some(ReplyData::ProjectAdd(a)) = reply.data else { panic!("{:?}", reply.error) };
+        assert_eq!((a.project.name.as_str(), a.project.project_type.as_str()), ("api", "single"));
+        assert_eq!(only_rpc(&host), ("project_add".to_string(), serde_json::json!({ "path": "/repo/api", "nonGit": false })));
+    }
+
+    #[test]
+    fn add_multi_refusals_fire_before_any_rpc() {
+        let tmp = bundle_dirs();
+        let host = bundle_host(tmp.path());
+        let refusals = [
+            // A taken name, either kind, case-insensitively: never a merge.
+            (add_cmd(None, &["alpha"], Some("WEB"), false, Some(tmp.path())), ErrorCode::Conflict, "pick another name with --name"),
+            (add_cmd(None, &["alpha"], Some("BUNDLE"), false, Some(tmp.path())), ErrorCode::Conflict, "`project members bundle --add <M>`"),
+            // No host means Termic creates one, named for the project.
+            (add_cmd(None, &["alpha"], None, false, Some(tmp.path())), ErrorCode::BadRequest, "--name"),
+            (add_cmd(None, &["alpha"], Some("  "), false, Some(tmp.path())), ErrorCode::BadRequest, "--name"),
+            (add_cmd(None, &["alpha"], Some("!!!"), false, Some(tmp.path())), ErrorCode::BadRequest, "letter or number"),
+            (add_cmd(None, &["alpha"], Some("shop"), true, Some(tmp.path())), ErrorCode::BadRequest, "--non-git"),
+            (add_cmd(Some("rel/host"), &["alpha"], Some("shop"), false, None), ErrorCode::BadRequest, "absolute path"),
+            (add_cmd(Some("gamma"), &["alpha", "gamma"], Some("shop"), false, Some(tmp.path())), ErrorCode::BadRequest, "own host"),
+        ];
+        for (cmd, code, says) in refusals {
+            let err = rpc_err(&host, cmd);
+            assert_eq!(err.code, code, "{}", err.message);
+            assert!(err.message.contains(says), "{}", err.message);
+        }
+        assert!(host.rpc_calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn project_members_lists_without_an_rpc() {
+        let tmp = bundle_dirs();
+        let host = bundle_host(tmp.path());
+        let Some(ReplyData::ProjectMembers(d)) = handle(&req(project_members_cmd("BUNDLE", &[], &[], None), Some("tok")), &host).data else { panic!() };
+        let names: Vec<_> = d.project.members.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!((d.project.name.as_str(), names), ("bundle", vec!["alpha", "beta"]));
+        assert!(host.rpc_calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn project_members_sends_the_full_list_kept_members_first() {
+        let tmp = bundle_dirs();
+        let host = bundle_host(tmp.path());
+        let reply = handle(&req(project_members_cmd("bundle", &["gamma", "web"], &["ALPHA"], Some(tmp.path())), Some("tok")), &host);
+        let (method, params) = only_rpc(&host);
+        assert_eq!((method.as_str(), params["projectId"].as_str()), ("project_set_members", Some("p9")));
+        assert_eq!(roots(&params), [canon(&tmp.path().join("beta")), canon(&tmp.path().join("gamma")), "/repo/web".into()]);
+        // A kept member goes back as it was stored, not re-derived.
+        assert_eq!(params["members"][0]["name"], "beta");
+        let Some(ReplyData::ProjectMembers(d)) = reply.data else { panic!("{:?}", reply.error) };
+        let saved: Vec<_> = d.project.members.iter().map(|m| m.root_path.clone()).collect();
+        assert_eq!(saved, roots(&params), "the reply is the re-read project");
+    }
+
+    #[test]
+    fn project_members_adding_a_member_already_there_sends_nothing() {
+        let tmp = bundle_dirs();
+        let host = bundle_host(tmp.path());
+        let alpha = tmp.path().join("alpha");
+        let Some(ReplyData::ProjectMembers(d)) =
+            handle(&req(project_members_cmd("bundle", &["alpha", alpha.to_str().unwrap()], &[], Some(tmp.path())), Some("tok")), &host).data
+        else {
+            panic!()
+        };
+        assert_eq!(d.project.members.len(), 2);
+        assert!(host.rpc_calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn project_members_refusals_fire_before_any_rpc() {
+        let tmp = bundle_dirs();
+        let host = bundle_host(tmp.path());
+        let cwd = Some(tmp.path());
+        let refusals = [
+            // Unlike task `members`, a remove that matches nothing is a typo to report.
+            (project_members_cmd("bundle", &[], &["delta"], cwd), ErrorCode::NotFound, "(members: alpha, beta)"),
+            (project_members_cmd("bundle", &["beta"], &["beta"], cwd), ErrorCode::BadRequest, "both added and removed"),
+            (project_members_cmd("bundle", &["host"], &[], cwd), ErrorCode::BadRequest, "own host"),
+            (project_members_cmd("bundle", &["delta"], &[], cwd), ErrorCode::NotFound, "neither a project nor a folder"),
+            (project_members_cmd("web", &[], &[], cwd), ErrorCode::BadRequest, "not a multi-repo project"),
+            (project_members_cmd("nope", &[], &[], cwd), ErrorCode::NotFound, "no project named"),
+        ];
+        for (cmd, code, says) in refusals {
+            let err = rpc_err(&host, cmd);
+            assert_eq!(err.code, code, "{}", err.message);
+            assert!(err.message.contains(says), "{}", err.message);
+        }
+        assert!(host.rpc_calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn project_members_reports_a_failed_save() {
+        let tmp = bundle_dirs();
+        let host = bundle_host(tmp.path());
+        host.script_rpc("project_set_members", Err("gamma does not exist".into()));
+        let err = rpc_err(&host, project_members_cmd("bundle", &["gamma"], &[], Some(tmp.path())));
+        assert_eq!(err.code, ErrorCode::Internal);
+        assert!(err.message.contains("gamma does not exist"), "{}", err.message);
     }
 
     // ── streamed replies over the real socket ────────────────────────

@@ -121,7 +121,10 @@ use std::io::{self, BufRead, Read, Write};
 /// the field and create a task with no member worktrees, or with every
 /// member linked, which reads as success. The `members` verb lists a
 /// multi-repo task's members and adds or removes them on the live task.
-/// `project list` reports each project's `type` and members.
+/// `project_add` gains `members` (with `name` and `cwd`), which creates a
+/// multi-repo project instead; `project_members` lists or changes a
+/// project's members; `project list` reports each project's `type` and
+/// members.
 pub const PROTOCOL_VERSION: u32 = 24;
 
 /// A pasted "123", "#123", "!123" or a PR / MR link, reduced to its number.
@@ -812,16 +815,44 @@ pub enum Command {
     /// Register a directory as a project (absolute path; the CLI
     /// canonicalizes before sending). `non_git` opts a plain folder in
     /// (the GUI's "add as plain folder" confirmation, as a flag).
+    ///
+    /// v24: `members` makes it a multi-repo project. Each entry is a spec
+    /// the server resolves: a registered single-repo project's name, a
+    /// directory (`~` or relative to `cwd`), or a folder name under
+    /// Settings' repos dir. `path` is then the host holding the shared
+    /// CLAUDE.md, resolved the same way, and `non_git` describes it; absent,
+    /// the app creates a git host and `name` is required. `name` defaults
+    /// to the host folder's name and is refused without `members`.
     ProjectAdd {
-        path: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
         #[serde(default)]
         non_git: bool,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        members: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
     },
     /// Registered projects with live-task counts.
     ProjectList,
     /// Unregister a project. Archives and deletes ALL its tasks; the
     /// CLI confirms before sending.
     ProjectRemove { name: String },
+    /// v24: list a multi-repo project's members, or change them: `add` takes
+    /// member specs (as `ProjectAdd`), `remove` the project's member
+    /// names. A member already there is not re-added. Never touches existing
+    /// tasks, whose composition is frozen at create.
+    ProjectMembers {
+        project: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        add: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        remove: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+    },
     /// This machine, the machines paired with it, and the unpaired ones in
     /// sight on the LAN (v22, docs/peers.md).
     PeerList,
@@ -1119,6 +1150,8 @@ pub enum ReplyData {
     ProjectList(ProjectListData),
     ProjectAdd(ProjectAddData),
     ProjectRemove(ProjectRemoveData),
+    /// `project members` (v24).
+    ProjectMembers(ProjectMembersData),
     Send(SendData),
     Apply(ApplyData),
     Diff(DiffData),
@@ -1529,7 +1562,7 @@ pub struct ProjectInfo {
 /// One member repo of a multi-repo project (v24).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct ProjectMemberInfo {
-    /// What `new --member` takes.
+    /// What `new --member` and `project members --remove` take.
     pub name: String,
     pub root_path: String,
     /// A plain folder: a task links it, never worktrees it.
@@ -1545,6 +1578,12 @@ pub struct ProjectListData {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ProjectAddData {
+    pub project: ProjectInfo,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ProjectMembersData {
+    /// The project after the call, re-read from disk.
     pub project: ProjectInfo,
 }
 
@@ -2588,10 +2627,28 @@ mod tests {
             Command::PadRead { task: Some("t1".into()), project: None, scope: None, pad: "p1".into(), cwd: None },
             Command::PadRemove { task: Some("t1".into()), project: None, scope: None, pad: "p1".into(), cwd: None },
             Command::PadClear { task: None, project: Some("web".into()), scope: Some("project".into()), cwd: None },
-            Command::ProjectAdd { path: "/repo/web".into(), non_git: false },
-            Command::ProjectAdd { path: "/notes/plain".into(), non_git: true },
+            Command::ProjectAdd { path: Some("/repo/web".into()), non_git: false, members: Vec::new(), name: None, cwd: None },
+            Command::ProjectAdd { path: Some("/notes/plain".into()), non_git: true, members: Vec::new(), name: None, cwd: None },
             Command::ProjectList,
             Command::ProjectRemove { name: "web".into() },
+            // v24 multi-repo shapes: a plain-folder host and member specs.
+            Command::ProjectAdd {
+                path: Some("../shop-host".into()),
+                non_git: true,
+                members: vec!["api".into(), "../web".into(), "~/src/infra".into()],
+                name: Some("shop".into()),
+                cwd: Some("/src/api".into()),
+            },
+            // No host: the app creates one, so the name is required.
+            Command::ProjectAdd { path: None, non_git: false, members: vec!["api".into()], name: Some("shop".into()), cwd: None },
+            Command::ProjectMembers {
+                project: "shop".into(),
+                add: vec!["infra".into()],
+                remove: vec!["Web".into()],
+                cwd: Some("/src".into()),
+            },
+            // List only.
+            Command::ProjectMembers { project: "shop".into(), add: Vec::new(), remove: Vec::new(), cwd: None },
             Command::PeerList,
             Command::PeerPair { target: "192.168.1.20:23620".into(), code: "4821".into() },
             Command::PeerUnpair { target: "laptop".into() },
@@ -2718,6 +2775,12 @@ mod tests {
                 ProjectMemberInfo { name: "docs".into(), root_path: "/src/docs".into(), non_git: true, base_branch: String::new() },
             ],
         }
+    }
+
+    #[test]
+    fn a_single_repo_project_add_keeps_its_pre_v24_wire_shape() {
+        let cmd = Command::ProjectAdd { path: Some("/repo/web".into()), non_git: false, members: Vec::new(), name: None, cwd: None };
+        assert_eq!(serde_json::to_string(&cmd).unwrap(), r#"{"cmd":"project_add","path":"/repo/web","non_git":false}"#);
     }
 
     #[test]
@@ -3028,6 +3091,7 @@ mod tests {
                     shop_project(),
                 ],
             }),
+            ReplyData::ProjectMembers(ProjectMembersData { project: shop_project() }),
             ReplyData::Pad(PadData {
                 task_id: "w1".into(),
                 pads: vec![PadInfo { id: "p1".into(), title: "findings".into(), syntax: None, open: true }],

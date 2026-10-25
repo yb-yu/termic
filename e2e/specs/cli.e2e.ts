@@ -1267,20 +1267,6 @@ describe("termic new --member: only the named members of a multi-repo task", () 
     rmTree(tmp, { bestEffort: true });
   });
 
-  it("project list reports it as multi-repo with its members, and a single repo as single", () => {
-    const projects = JSON.parse(runCli(["--no-launch", "--json", "project", "list"],
-      { TERMIC_DATA_DIR: dataDir })).projects;
-    const p = projects.find((p: any) => p.name === PROJECT);
-    expect(p.type).toBe("multi");
-    expect(p.members.map((m: any) => [m.name, fs.realpathSync(m.root_path), m.non_git, m.base_branch])).toEqual([
-      ["alpha", fs.realpathSync(repo("alpha")), false, "main"],
-      ["beta", fs.realpathSync(repo("beta")), false, "main"],
-    ]);
-    const single = projects.find((p: any) => p.name === "fixture-repo");
-    expect(single.type).toBe("single");
-    expect(single.members).toBeUndefined();
-  });
-
   it("worktrees only the named member, on the task branch", async () => {
     // Case-insensitive, and no --worktree: naming a member means a worktree.
     const out = JSON.parse(cli("cli-multi-alpha", "--member", "ALPHA"));
@@ -1391,6 +1377,137 @@ describe("termic new --member: only the named members of a multi-repo task", () 
       expect(fs.existsSync(alpha)).toBe(false);
       expect(dirs()).toEqual([]);
     });
+  });
+});
+
+// `project add --member` and `project members` (proto v24): a multi-repo
+// project made and changed through the real CLI, then a task on it. The
+// host is always a folder under the tmp dir: an auto-created one would land
+// in the real ~/<app dir>/projects.
+describe("termic project add --member: a multi-repo project from the CLI", () => {
+  const PROJECT = "e2e-cli-bundle";
+  const OTHER = "e2e-cli-bundle-other";
+  const env = { TERMIC_DATA_DIR: dataDir };
+  const gitIn = (cwd: string, args: string) =>
+    execSync(`git ${args}`, { cwd, encoding: "utf8" }).trim();
+  const repo = (name: string) => path.join(tmp, name);
+  const real = (p: string) => fs.realpathSync(p);
+  const project = (...args: string[]) =>
+    JSON.parse(runCli(["--no-launch", "--json", "project", ...args], env, tmp));
+  const failure = (...args: string[]) => {
+    try {
+      project(...args);
+    } catch (e) {
+      return (e as Error).message;
+    }
+    throw new Error(`project ${args.join(" ")} succeeded`);
+  };
+  const listed = (name: string) =>
+    project("list").projects.find((p: any) => p.name === name);
+  const stored = (taskId: string) =>
+    JSON.parse(fs.readFileSync(path.join(dataDir, "tasks", `${taskId}.json`), "utf8"));
+  const removeProjects = () => browser.execute(async (names) => {
+    const t = window.__termic!;
+    await t.useApp.getState().loadAll();
+    for (const p of t.useApp.getState().projects.filter((p: any) => names.includes(p.name))) {
+      for (const task of t.useApp.getState().tasks) {
+        if (task.project_id === p.id && !task.archived) await t.ipc.taskArchive(task.id, true);
+      }
+      try { await t.ipc.projectRemove(p.id); } catch { /* already gone */ }
+    }
+    await t.useApp.getState().loadAll();
+  }, [PROJECT, OTHER]);
+
+  let tmp = "";
+  let taskId = "";
+
+  before(async () => {
+    await waitForAppShell();
+    await requireTermicApi();
+    await waitForClisDetected();
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), "e2e-cli-bundle-"));
+    fs.mkdirSync(repo("host"));
+    fs.mkdirSync(repo("plain-host"));
+    for (const name of ["alpha", "beta", "gamma"]) {
+      fs.mkdirSync(repo(name));
+      gitIn(repo(name), "init -b main -q");
+      fs.writeFileSync(path.join(repo(name), "README.md"), `# ${name}\n`);
+      gitIn(repo(name), "add .");
+      gitIn(repo(name), "-c user.email=e2e@termic.dev -c user.name=e2e commit -q -m init");
+    }
+    // A run that died before its teardown leaves the projects behind.
+    await removeProjects();
+  });
+
+  after(async () => {
+    await removeProjects();
+    rmTree(tmp, { bestEffort: true });
+  });
+
+  it("creates it from a plain-folder host and member paths, and project list shows them", () => {
+    // `beta` is relative: it resolves against the CLI's own cwd (tmp).
+    const out = project("add", repo("host"), "--non-git", "--name", PROJECT, "--member", repo("alpha"), "--member", "beta");
+    expect([out.project.name, out.project.type]).toEqual([PROJECT, "multi"]);
+    const p = listed(PROJECT);
+    expect(p.type).toBe("multi");
+    expect(real(p.root_path)).toBe(real(repo("host")));
+    expect(p.members.map((m: any) => [m.name, real(m.root_path), m.non_git])).toEqual([
+      ["alpha", real(repo("alpha")), false],
+      ["beta", real(repo("beta")), false],
+    ]);
+    // The backend filled each base the repo can branch from.
+    expect(p.members.every((m: any) => /main$/.test(m.base_branch))).toBe(true);
+    // A single-repo row says so and lists no members.
+    expect(listed("fixture-repo")).toMatchObject({ type: "single" });
+    expect(listed("fixture-repo").members).toBeUndefined();
+  });
+
+  it("new --member worktrees only that member of the new project", () => {
+    const out = JSON.parse(runCli(
+      ["--no-launch", "--json", "new", "cli-bundle-alpha", "--project", PROJECT, "--member", "alpha", "--agent", "fakeagent"],
+      env));
+    taskId = out.task.id;
+    const task = stored(taskId);
+    expect(task.composition.map((m: any) => [m.dir_name, m.mode])).toEqual([["alpha", "worktree"]]);
+    const alpha = task.composition[0];
+    expect(gitIn(alpha.path, "rev-parse --abbrev-ref HEAD")).toBe(task.branch);
+    expect(real(alpha.path)).not.toBe(real(repo("alpha")));
+    expect(gitIn(repo("beta"), `branch --list ${JSON.stringify(task.branch)}`)).toBe("");
+  });
+
+  it("project members --add appends a repo, a repeat changes nothing, and --remove takes one out", () => {
+    const names = (out: any) => out.project.members.map((m: any) => m.name);
+    expect(names(project("members", PROJECT))).toEqual(["alpha", "beta"]);
+    expect(names(project("members", PROJECT, "--add", repo("gamma")))).toEqual(["alpha", "beta", "gamma"]);
+    expect(names(project("members", PROJECT, "--add", "gamma", "--add", "alpha"))).toEqual(["alpha", "beta", "gamma"]);
+    expect(names(project("members", PROJECT, "--remove", "ALPHA"))).toEqual(["beta", "gamma"]);
+    // The project changed; the task made from it did not.
+    const task = stored(taskId);
+    expect(task.composition.map((m: any) => m.dir_name)).toEqual(["alpha"]);
+    expect(fs.existsSync(task.composition[0].path)).toBe(true);
+  });
+
+  it("refuses a plain-folder host without --non-git, a taken name and an unknown member, creating nothing", () => {
+    let err = failure("add", repo("plain-host"), "--name", OTHER, "--member", repo("alpha"));
+    expect(err).toContain("exit 1");
+    expect(err).toContain("Pass --non-git to use a plain folder as the host");
+    err = failure("add", repo("plain-host"), "--non-git", "--name", PROJECT.toUpperCase(), "--member", repo("alpha"));
+    expect(err).toContain(`a project named "${PROJECT}" already exists`);
+    err = failure("add", repo("plain-host"), "--non-git", "--name", OTHER, "--member", "no-such-repo");
+    expect(err).toContain('"no-such-repo" is neither a project nor a folder');
+    expect(err).toContain("fixture-repo");
+    expect(listed(OTHER)).toBeUndefined();
+    expect(fs.readdirSync(repo("plain-host"))).toEqual([]);
+  });
+
+  it("refuses an unknown member name and a single-repo project for project members", () => {
+    let err = failure("members", PROJECT, "--remove", "delta");
+    expect(err).toContain("(members: beta, gamma)");
+    err = failure("members", "fixture-repo");
+    expect(err).toContain("not a multi-repo project");
+    expect(listed(PROJECT).members.map((m: any) => m.name)).toEqual(["beta", "gamma"]);
+    // --name only means something with --member: a usage error, before any call.
+    expect(failure("add", repo("plain-host"), "--name", OTHER)).toContain("exit 2");
   });
 });
 

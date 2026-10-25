@@ -1643,25 +1643,54 @@ Exit codes: 0 cleared (also when there was nothing to remove), 1 error (unknown 
 
 #[derive(Subcommand, Debug)]
 pub enum ProjectCmd {
-    /// Register a directory as a project (`termic project add .`).
+    /// Register a directory as a project (`termic project add .`), or a
+    /// multi-repo project with --member.
     #[command(
         after_help = "The non-interactive registration path scripts need: no prompt, the \
 directory (default: the current one) must be a git repository. Prints the \
 registered project on stdout; with --output-format json, one object: \
 {\"project\": {id, name, root_path, tasks, default_agent, type, members}}.
 
-Exit codes: 0 registered (or already registered), 1 error (not a git \
-repository, missing directory), 4 app not running, 5 CLI disabled, \
-6 refused, 8 connection lost."
+--member <M> registers a multi-repo project instead: one project holding \
+the repos (possibly many, such as every service a team owns), from which each \
+task picks the ones it needs with `new --member`. Repeat it once per repo. \
+<M> is tried, in order, as a registered single-repo project's name \
+(case-insensitive; its path, base branch, scripts and sandbox lists are \
+copied), a directory path (~ or relative to the current directory), then a \
+folder of that name in Settings' repos folder. A repo given twice is added \
+once; an unknown one fails before anything is created, listing the \
+single-repo projects. The repos are copied in, never registered on their own.
+
+With --member, <PATH> is the host: the folder holding the shared CLAUDE.md \
+and AGENTS.md every task of the project sees. It must be a git repository, a \
+plain folder with --non-git, or a folder that does not exist yet, which is \
+created. Without <PATH>, Termic creates a git host in its projects folder \
+and --name is required. --name defaults to the host folder's name, and a \
+project of that name already existing is an error, never a merge. Change the \
+repos later with `project members`.
+
+Exit codes: 0 registered (or, without --member, already registered), 1 error \
+(not a git repository, missing directory, unknown member, a taken name), \
+4 app not running, 5 CLI disabled, 6 refused, 8 connection lost."
     )]
     Add {
-        /// Directory to register (default: the current directory).
-        #[arg(default_value = ".")]
-        path: String,
+        /// Directory to register (default: the current directory). With
+        /// --member, the host folder (default: one Termic creates).
+        path: Option<String>,
         /// Register a plain (non-git) folder. Non-git projects only
-        /// support main-checkout tasks (worktrees need git).
+        /// support main-checkout tasks (worktrees need git). With
+        /// --member, the host is the plain folder; its members still get
+        /// worktrees.
         #[arg(long)]
         non_git: bool,
+        /// A member repo, which makes this a multi-repo project: a project
+        /// name, a path, or a folder in Settings' repos folder. Repeat for
+        /// more.
+        #[arg(long = "member", value_name = "M")]
+        members: Vec<String>,
+        /// The multi-repo project's name. Default: the host folder's name.
+        #[arg(long, requires = "members")]
+        name: Option<String>,
     },
     /// List registered projects with live-task counts.
     #[command(
@@ -1675,6 +1704,41 @@ Exit codes: 0 success, 1 error, 4 app not running, 5 CLI disabled, \
 6 refused, 8 connection lost."
     )]
     List,
+    /// List a multi-repo project's member repos, or add and remove them.
+    #[command(
+        after_help = "Without --add or --remove, prints each member: its name (what \
+`new --member` and --remove take), whether it is a git repo or a plain \
+folder, the base branch its worktrees start from, and its path.
+
+--add <M> adds a repo, resolved like `project add --member`: a registered \
+single-repo project's name, a directory path (~ or relative to the current \
+directory), then a folder of that name in Settings' repos folder. Adding a \
+repo the project already has does nothing. --remove <NAME> takes out the \
+member of that name (case-insensitive); a name that is not a member fails, \
+listing the members, so a typo never reads as done. Repeat either for more.
+
+This changes the project, never a task: each task keeps the members it was \
+created with. `members <task> --add/--remove` changes a live task.
+
+Prints the members after the call. With --output-format json, one object: \
+{\"project\": {id, name, root_path, tasks, default_agent, type, members: \
+[{name, root_path, non_git, base_branch}]}}.
+
+Exit codes: 0 ok, 1 error (unknown project, not a multi-repo project, \
+unknown member, a repo both added and removed), 4 app not running, 5 CLI \
+disabled, 6 refused, 8 connection lost."
+    )]
+    Members {
+        /// Project name.
+        project: String,
+        /// A repo to add: a project name, a path, or a folder in Settings'
+        /// repos folder. Repeat for more.
+        #[arg(long = "add", value_name = "M")]
+        add: Vec<String>,
+        /// A member to remove, by name. Repeat for more.
+        #[arg(long = "remove", value_name = "NAME")]
+        remove: Vec<String>,
+    },
     /// Unregister a project and archive ALL its tasks.
     #[command(
         after_help = "Destructive: every task of the project is archived and its worktree \
@@ -2733,7 +2797,7 @@ fn run_new_wire(
             // a busy webview must not turn a confirmed registration
             // into a false "connection lost".
             fresh.set_read_timeout(client::PROJECT_ADD_READ_TIMEOUT);
-            let add = proto::Command::ProjectAdd { path: root, non_git: false };
+            let add = proto::Command::ProjectAdd { path: Some(root), non_git: false, members: Vec::new(), name: None, cwd: None };
             client::request(&mut fresh, add, token)?;
             run_streamed(&mut fresh, wire, token, format).map_err(StreamError::into_cli)?
         }
@@ -3247,7 +3311,29 @@ fn execute_project(
             };
             Ok(Output::ok(final_stdout(format, &output::project_list_text(&l.projects), &l)))
         }
-        ProjectCmd::Add { path, non_git } => {
+        ProjectCmd::Add { path, non_git, members, name } if !members.is_empty() => {
+            conn.set_read_timeout(client::PROJECT_ADD_READ_TIMEOUT);
+            let data = client::request(
+                conn,
+                proto::Command::ProjectAdd {
+                    // Sent as typed, with our cwd: the server resolves a
+                    // host that may not exist yet and member specs that may
+                    // be project names, never against ITS cwd.
+                    path: path.clone(),
+                    non_git: *non_git,
+                    members: members.clone(),
+                    name: name.clone(),
+                    cwd: std::env::current_dir().ok().map(|p| p.to_string_lossy().into_owned()),
+                },
+                token,
+            )?;
+            let proto::ReplyData::ProjectAdd(a) = data else {
+                return Err(CliError::new(exit_code::ERROR, "unexpected reply to project add"));
+            };
+            Ok(Output::ok(final_stdout(format, &output::project_add_text(&a.project), &a)))
+        }
+        ProjectCmd::Add { path, non_git, .. } => {
+            let path = path.as_deref().unwrap_or(".");
             // Canonicalize CLIENT-side: the server must never resolve a
             // relative path against ITS cwd.
             let abs = std::fs::canonicalize(path).map_err(|e| {
@@ -3257,8 +3343,11 @@ fn execute_project(
             let data = client::request(
                 conn,
                 proto::Command::ProjectAdd {
-                    path: abs.to_string_lossy().into_owned(),
+                    path: Some(abs.to_string_lossy().into_owned()),
                     non_git: *non_git,
+                    members: Vec::new(),
+                    name: None,
+                    cwd: None,
                 },
                 token,
             )?;
@@ -3309,6 +3398,25 @@ fn execute_project(
                 return Err(CliError::new(exit_code::ERROR, "unexpected reply to project remove"));
             };
             Ok(Output::ok(final_stdout(format, &output::project_remove_text(&r), &r)))
+        }
+        ProjectCmd::Members { project, add, remove } => {
+            if !add.is_empty() || !remove.is_empty() {
+                conn.set_read_timeout(client::PROJECT_ADD_READ_TIMEOUT);
+            }
+            let data = client::request(
+                conn,
+                proto::Command::ProjectMembers {
+                    project: project.clone(),
+                    add: add.clone(),
+                    remove: remove.clone(),
+                    cwd: std::env::current_dir().ok().map(|p| p.to_string_lossy().into_owned()),
+                },
+                token,
+            )?;
+            let proto::ReplyData::ProjectMembers(m) = data else {
+                return Err(CliError::new(exit_code::ERROR, "unexpected reply to project members"));
+            };
+            Ok(Output::ok(final_stdout(format, &output::project_members_text(&m.project), &m)))
         }
     }
 }
@@ -4111,6 +4219,49 @@ mod tests {
     }
 
     #[test]
+    fn project_add_member_flag_rules() {
+        let project = |argv: &[&str]| -> ProjectCmd {
+            let Cmd::Project(p) = Cli::try_parse_from(argv).unwrap().cmd else { panic!() };
+            p
+        };
+        // A host, repeatable members in the order typed (the server owns
+        // resolution and dedup), and a name.
+        let ProjectCmd::Add { path, non_git, members, name } = project(&[
+            "termic", "project", "add", "../host", "--member", "api", "--member", "~/src/web", "--name", "shop", "--non-git",
+        ]) else {
+            panic!()
+        };
+        assert_eq!((path.as_deref(), non_git, name.as_deref()), (Some("../host"), true, Some("shop")));
+        assert_eq!(members, ["api", "~/src/web"]);
+        // No host path: Termic creates one (the server requires --name then).
+        let ProjectCmd::Add { path, members, .. } = project(&["termic", "project", "add", "--member", "api", "--name", "shop"]) else {
+            panic!()
+        };
+        assert!(path.is_none() && members == ["api"]);
+        // Without --member it is the single-repo add, and --name means nothing there.
+        let ProjectCmd::Add { path, members, name, .. } = project(&["termic", "project", "add"]) else { panic!() };
+        assert!(path.is_none() && members.is_empty() && name.is_none());
+        assert!(Cli::try_parse_from(["termic", "project", "add", ".", "--name", "x"]).is_err(), "--name needs --member");
+    }
+
+    #[test]
+    fn project_members_flag_rules() {
+        let cli = Cli::try_parse_from([
+            "termic", "project", "members", "shop", "--add", "infra", "--add", "../billing", "--remove", "Web",
+        ])
+        .unwrap();
+        let Cmd::Project(ProjectCmd::Members { project, add, remove }) = cli.cmd else { panic!() };
+        assert_eq!(project, "shop");
+        assert_eq!((add, remove), (vec!["infra".to_string(), "../billing".into()], vec!["Web".to_string()]));
+        let Cmd::Project(ProjectCmd::Members { add, remove, .. }) = Cli::try_parse_from(["termic", "project", "members", "shop"]).unwrap().cmd
+        else {
+            panic!()
+        };
+        assert!(add.is_empty() && remove.is_empty(), "no flags lists");
+        assert!(Cli::try_parse_from(["termic", "project", "members"]).is_err(), "the project is required");
+    }
+
+    #[test]
     fn prop_parses_set_clear_and_list_and_guards_its_limits() {
         let cli = Cli::try_parse_from(["termic", "prop", "ticket", "ABC-1"]).unwrap();
         let Cmd::Prop { key, value, tab, task, .. } = &cli.cmd else { panic!("not prop") };
@@ -4739,7 +4890,7 @@ mod tests {
             "scratchpad list", "scratchpad new", "scratchpad write", "scratchpad read",
             "scratchpad rm", "scratchpad clear",
             "schedule list", "schedule show", "schedule set", "schedule run", "schedule delete",
-            "members",
+            "members", "project members",
         ] {
             assert!(names.contains(&expected), "missing {expected} in {names:?}");
         }

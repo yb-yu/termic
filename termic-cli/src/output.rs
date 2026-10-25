@@ -480,6 +480,25 @@ fn multi_suffix(p: &ProjectInfo) -> String {
     }
 }
 
+/// `project members`: one row per member repo, `-` for a folder's base.
+pub fn project_members_text(p: &ProjectInfo) -> String {
+    if p.members.is_empty() {
+        return format!("{} has no members (`project members {} --add <repo>` adds one)", p.name, p.name);
+    }
+    let rows: Vec<[&str; 4]> = std::iter::once(["MEMBER", "KIND", "BASE", "PATH"])
+        .chain(p.members.iter().map(|m| {
+            let (kind, base) = if m.non_git { ("folder", "-") } else { ("git", m.base_branch.as_str()) };
+            [m.name.as_str(), kind, base, m.root_path.as_str()]
+        }))
+        .collect();
+    let width = |i: usize| rows.iter().map(|r| r[i].chars().count()).max().unwrap_or(0);
+    let (w0, w1, w2) = (width(0), width(1), width(2));
+    rows.iter()
+        .map(|r| format!("{:w0$}  {:w1$}  {:w2$}  {}", r[0], r[1], r[2], r[3]))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// What a grant means, in the words a person deciding needs.
 fn grant_text(g: &str) -> &str {
     match g {
@@ -1041,6 +1060,18 @@ bare  1      claude  /src/shop  (multi-repo, no members)";
     }
 
     #[test]
+    fn project_members_text_golden() {
+        let expected = "\
+MEMBER    KIND    BASE         PATH
+api       git     origin/main  /src/api
+handbook  folder  -            /src/docs";
+        assert_eq!(project_members_text(&shop()), expected);
+        let mut d = shop();
+        d.members.clear();
+        assert_eq!(project_members_text(&d), "shop has no members (`project members shop --add <repo>` adds one)");
+    }
+
+    #[test]
     fn list_text_empty() {
         assert_eq!(list_text(&[]), "no tasks");
     }
@@ -1447,6 +1478,7 @@ commits:
                 killed_agents: 0,
             }),
             project_list_text(&[ProjectInfo::default(), shop()]),
+            project_members_text(&shop()),
             project_remove_text(&ProjectRemoveData { name: "n".into(), removed_tasks: 0 }),
         ] {
             assert!(!s.contains('\u{2014}'), "em dash in output: {s}");

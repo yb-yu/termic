@@ -1514,10 +1514,10 @@ function ownSocket(env: Record<string, string>): Record<string, string> {
   return { TERMIC_SOCKET: path.join(env.TERMIC_DATA_DIR, "termic.sock") };
 }
 
-export function runCli(args: string[], env: Record<string, string>): string {
+export function runCli(args: string[], env: Record<string, string>, cwd = path.resolve(".")): string {
   try {
     return execFileSync(cliBinary(), args, {
-      cwd: path.resolve("."),
+      cwd,
       env: { ...process.env, ...ownSocket(env), ...env },
       encoding: "utf8",
     });

@@ -294,11 +294,43 @@ members, and an error is internal with the backend's message plus the
 members the task now has. Unlike the dialog, nothing toasts a failed
 setup script for an added member (same as `new --member`).
 
-`termic project list` (MCP `project_list`) is where a caller finds
-those names: `ProjectInfo` carries `type` ("single" or "multi", the
-`Project.type` key) and a multi project's `members`, each one's
-`name`, `root_path`, `non_git` and `base_branch`
-(`ProjectMemberInfo`), filled by `project_info` from the disk read.
+`termic project add --member` and `termic project members` (proto v24,
+`Command::ProjectAdd.members` and `Command::ProjectMembers`, MCP
+`project_add` `members` and `project_members`) build the project those
+two pick from. `members` on `ProjectAdd` is what makes it a multi-repo
+add; without it the single-repo path is unchanged, `name` is refused,
+and so is a missing `path`. Each member spec goes through ONE function,
+`resolve_member_spec`, against the disk-read projects: a registered
+project's name first (`find_project`; a multi-repo one is bad_request),
+copied field for field as the dialog's `addMemberFromProject` does;
+then a directory, `~` expanded and a relative spec joined to the
+request's `cwd` (none from MCP, and `--peer` strips it, so a relative
+spec is a name there); then a bare name under the target profile's
+Settings `repos_dir` (`CliHost::repos_dir`, the profile whose window
+the RPC reaches). Anything else is not_found naming the paths tried and
+listing the single-repo projects. A disk member carries only its
+canonical `root_path`, like `addMemberFromDisk`: `normalize_member`
+fills name, `non_git` and base on save, so the server detects none of
+them. `append_member_specs` drops a root already in the list and
+refuses the host as a member.
+
+The add (`handle_project_add_multi`) resolves the host like a member
+path (empty means Rust creates `~/<app dir>/projects/<slug>`), defaults
+the name to the host folder's (the dialog has no default; with no host
+`--name` is required), refuses a taken name case-insensitively as
+conflict, maps the backend's "not a git repo" to the `--non-git` hint
+as `project add` does, and sends the webview's `project_add_multi`
+`{ path, name, members, nonGit }`; the handler calls `projectAddMulti`
+then `loadAll` and returns `{ projectId }`, and the server replies
+`ProjectAdd` re-read from disk. `handle_project_members` lists with no
+RPC; `remove` takes member names through `resolve_new_members` (an
+unknown one is not_found, unlike task `members`), a root both added and
+removed is bad_request, and only a real change sends
+`project_set_members` `{ projectId, members }` with the FULL list (kept
+members in order, then the added ones), the Repository page's
+`projectSetMembers` save. Neither touches a task: compositions are
+frozen at create. `ProjectInfo` carries `type` ("single" or "multi",
+the `Project.type` key) and a multi project's `members`.
 
 ### Non-blocking task creation (GH #242)
 
